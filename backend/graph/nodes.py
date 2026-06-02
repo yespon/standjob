@@ -1,16 +1,31 @@
 """
 岗标辅导 Graph Nodes
-每个 node 接收 CoachState，返回部分状态更新（dict）。
+
+完全实现 gangbiao-coach skill v2 的能力：
+  - 阶段 0：check_progress + 文件采集提示
+  - 阶段 1：validate_structure（结构校验+内容提取）
+  - 阶段 2：review_item（全面评审，三问法+严格度校准）
+  - 阶段 3：guide_reflection（分步引导，五条铁律+引导武器+十一问）
+           process_response（回判三步+卡住升级）
+           detect_user_intent + answer_user_question（意图识别+被动答疑）
+  - 阶段 4：generate_closure（收尾总结）
 """
 from __future__ import annotations
 import os
 import json
+import subprocess
+import shutil
+from pathlib import Path
 from typing import Any, Optional
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from .state import CoachState, ReviewItem
+from .state import (
+    CoachState, ReviewItem, RUBRIC_ITEMS, RUBRIC_INDEX,
+    GUIDANCE_WEAPONS, STRICTNESS_TABLE, REAL_EXAMPLE,
+    SELF_CHECK_QUESTIONS, WHO_HINTS, BENEFIT_HINTS, BIZ_HINTS,
+)
 from ..loaders import (
     load_scoring_criteria,
     load_submission,
@@ -20,12 +35,21 @@ from ..loaders import (
 )
 
 # ─────────────────────────────────────────────────────────────
+# 常量
+# ─────────────────────────────────────────────────────────────
+QUESTION_HINTS = ("?", "？", "什么", "为何", "为什么", "如何", "怎么", "请问", "能否", "可以", "是否")
+REPLY_HINTS = ("我觉得", "我理解", "我会", "我打算", "我修改", "可以改成", "因为", "我的回答", "我先")
+
+# 项目内嵌的参考文件路径
+REFERENCES_DIR = Path(__file__).parent.parent / "references"
+SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
+
+# ─────────────────────────────────────────────────────────────
 # LLM 实例（延迟初始化）
 # ─────────────────────────────────────────────────────────────
 _llm_instance = None
 
 def _get_llm():
-    """延迟初始化 LLM 实例，避免导入时立即初始化"""
     global _llm_instance
     if _llm_instance is None and _is_llm_enabled():
         try:
@@ -42,102 +66,142 @@ def _get_llm():
 
 
 def _is_llm_enabled() -> bool:
-    """检查 LLM 是否启用"""
     disabled = os.environ.get("STANDJOB_DISABLE_LLM", "").lower() in {"1", "true", "yes", "on"}
     if disabled:
         return False
-    has_key = any(os.environ.get(k) for k in ("OPENAI_API_KEY", "DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY"))
-    return has_key
+    return any(os.environ.get(k) for k in ("OPENAI_API_KEY", "DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY"))
 
 
-# 保持向后兼容
-QUESTION_HINTS = ("?", "？", "什么", "为何", "为什么", "如何", "怎么", "请问", "能否", "可以", "是否")
-REPLY_HINTS = ("我觉得", "我理解", "我会", "我打算", "我修改", "可以改成", "因为", "我的回答", "我先")
-LLM_DISABLED_BY_ENV = os.environ.get("STANDJOB_DISABLE_LLM", "").lower() in {"1", "true", "yes", "on"}
+# ─────────────────────────────────────────────────────────────
+# 参考文件加载
+# ─────────────────────────────────────────────────────────────
+
+def _load_rubric_text() -> str:
+    """加载项目内嵌的 rubric.md，不存在则使用 MOCK 数据"""
+    path = REFERENCES_DIR / "rubric.md"
+    if path.exists():
+        return path.read_text(encoding="utf-8")
+    return MOCK_SCORING_CRITERIA
 
 
-@property
-def LLM_ENABLED() -> bool:
-    """LLM 是否可用（延迟检查）"""
-    return _is_llm_enabled()
-
-RUBRIC_ITEMS: list[dict[str, Any]] = [
-    {"id": 1, "category": "岗位价值", "level": "A", "desc": "站在自身视角而不是站在客户视角提炼岗位价值"},
-    {"id": 2, "category": "岗位价值", "level": "A", "desc": "岗位价值并非源于对客户最在意、最深层需求的提炼"},
-    {"id": 3, "category": "岗位价值", "level": "A", "desc": "没有从不同客户的视角出发，去提炼岗位价值"},
-    {"id": 4, "category": "岗位价值", "level": "A", "desc": "岗位价值描述空泛，指导性不强"},
-    {"id": 5, "category": "岗位效能", "level": "A", "desc": "岗位效能并不能直接、有效地衡量岗位价值"},
-    {"id": 6, "category": "岗位任务", "level": "A", "desc": "核心任务的目的集合无法完整覆盖岗位价值"},
-    {"id": 7, "category": "岗位任务", "level": "B", "desc": "任务命名未按动词+修饰语+名词"},
-    {"id": 8, "category": "岗位任务", "level": "B", "desc": "直接用目的命名任务"},
-    {"id": 9, "category": "任务目的与成果", "level": "A", "desc": "任务目的模糊，导致为何而做不清"},
-    {"id": 10, "category": "任务目的与成果", "level": "A", "desc": "成果标准与任务目的脱节"},
-    {"id": 11, "category": "任务目的与成果", "level": "A", "desc": "任务成果评估周期设计过长"},
-    {"id": 12, "category": "任务目的与成果", "level": "A", "desc": "成果标准不符合SMART原则"},
-    {"id": 13, "category": "任务目的与成果", "level": "A", "desc": "把交付物当做成果"},
-    {"id": 14, "category": "任务目的与成果", "level": "A", "desc": "成果标准未在完成度、交期、预算上设计挑战目标"},
-]
-
-RUBRIC_INDEX = {item["id"]: item for item in RUBRIC_ITEMS}
-WHO_HINTS = ("客户", "用户", "产品经理", "研发", "业务", "销售", "团队", "测试", "运营")
-BENEFIT_HINTS = ("减少", "提升", "降低", "提高", "保障", "避免", "缩短", "稳定", "改善")
-BIZ_HINTS = ("收入", "成本", "风险", "品牌", "口碑", "市场", "利润", "效率")
-
-# 教材示例引用（用于引导时引用具体案例）
-TEXTBOOK_EXAMPLES = {
-    "岗位价值": {
-        "正例": "对产品经理的价值是'减少缺陷流出，避免口碑拖累市场推广，夯实产品质量竞争力'",
-        "反例": "充分理解用户和产品需求，设计并实现易用、体验好、高性价比解法...（动作偏多，但包含客户、收获、商业结果——不需要死磕）",
-        "认知陷阱": [
-            "视角偏差：固守'我能做什么'，而非传递'你能得到什么'",
-            "深度偏差：轻信'客户开的药方'，没挖到真实问题",
-        ],
-    },
-    "岗位效能": {
-        "测试工程师例子": "价值是'减少缺陷流出'，对应效能是'缺陷泄漏率≤0.5%；线上重大故障：0次'。价值是'提供清晰质量反馈'，对应效能是'缺陷描述一次通过率≥95%'",
-    },
-    "岗位任务": {
-        "命名格式": "动词+修饰语+名词，例如'整理客户拜访纪要'",
-        "反例": "'降低产品成本'（直接用目的命名，只标出终点，未指引行动）",
-    },
-    "任务目的与成果": {
-        "客服例子": "目的从'5分钟内首次响应'校准为'一次性彻底解决用户疑问，避免二次进线'后，完成度变为'用户回复已解决且24小时内未就同一问题再次咨询'",
-        "交付陷阱": "低效委派是'你开发一套产品培训课件'，高效委派要明确'目的：解决因一线工程师不熟悉产品内部原理导致故障处理时长超标'，'成果：一个月内将平均故障处理时长从6小时降至3小时以内'",
-    },
-    "服务客户": {
-        "财务BP": "客户是业务部门负责人，而非财务总监",
-        "服务团队": "把'工程商'细分为'中大型集成商'和'小型承包商'",
-    },
-}
+def _load_textbook_text() -> str:
+    """加载项目内嵌的 textbook.md，不存在则使用 MOCK 数据"""
+    path = REFERENCES_DIR / "textbook.md"
+    if path.exists():
+        return path.read_text(encoding="utf-8")
+    return MOCK_TEACHING_MATERIAL
 
 
-def _rubric_catalog_text() -> str:
-    lines = []
-    for item in RUBRIC_ITEMS:
-        lines.append(
-            f"{item['id']}. [{item['category']}] {item['desc']} (等级{item['level']})"
+# ─────────────────────────────────────────────────────────────
+# 进度脚本调用
+# ─────────────────────────────────────────────────────────────
+
+def _call_progress_script(*args: str) -> Optional[dict]:
+    """调用 progress.py 脚本，返回解析后的 JSON 或 None"""
+    script = SCRIPTS_DIR / "progress.py"
+    if not script.exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["python3", str(script)] + list(args),
+            capture_output=True, text=True, timeout=10,
         )
-    return "\n".join(lines)
-
-
-def _coerce_rubric_item_id(raw: Any) -> Optional[int]:
-    if raw is None:
-        return None
-    s = str(raw).strip()
-    if not s:
-        return None
-    digits = "".join(ch for ch in s if ch.isdigit())
-    if not digits:
-        return None
-    item_id = int(digits)
-    if item_id in RUBRIC_INDEX:
-        return item_id
+        if result.returncode == 0 and result.stdout.strip():
+            return json.loads(result.stdout.strip())
+    except Exception as e:
+        print(f"[进度脚本] 调用失败: {e}")
     return None
+
+
+def _call_validate_script(file_path: str, extract: bool = False) -> Optional[dict]:
+    """调用 validate_sheets.py 脚本"""
+    script = SCRIPTS_DIR / "validate_sheets.py"
+    if not script.exists():
+        return None
+    cmd = ["python3", str(script), file_path]
+    if extract:
+        cmd.append("--extract")
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30,
+        )
+        if result.stdout.strip():
+            return json.loads(result.stdout.strip())
+    except Exception as e:
+        print(f"[校验脚本] 调用失败: {e}")
+    return None
+
+
+# ─────────────────────────────────────────────────────────────
+# 辅助函数
+# ─────────────────────────────────────────────────────────────
+
+def _safe_json_load(raw: str, fallback: dict) -> dict:
+    cleaned = raw.strip()
+    if "```" in cleaned:
+        cleaned = cleaned.split("```")[1]
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:]
+    try:
+        return json.loads(cleaned.strip())
+    except Exception:
+        return fallback
+
+
+def _is_question_intent(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    return any(h in stripped for h in QUESTION_HINTS)
+
+
+def _is_reply_intent(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    return any(h in stripped for h in REPLY_HINTS)
+
+
+def _rule_based_intent(text: str) -> tuple[str, float]:
+    stripped = (text or "").strip()
+    if not stripped:
+        return "reply", 0.6
+    q = _is_question_intent(stripped)
+    r = _is_reply_intent(stripped)
+    if q and not r:
+        return "question", 0.85
+    if r and not q:
+        return "reply", 0.8
+    if q and r:
+        return "uncertain", 0.4
+    return "reply", 0.55
+
+
+def _passes_three_questions(text: str) -> bool:
+    """三问法：客户主语 + 具体好处 + 商业落点"""
+    candidate = (text or "").strip()
+    if not candidate:
+        return False
+    has_who = any(k in candidate for k in WHO_HINTS) or any(
+        k in candidate.lower() for k in ("product manager", "business", "customer", "user", "team", "stakeholder")
+    )
+    has_benefit = any(k in candidate for k in BENEFIT_HINTS) or any(
+        k in candidate.lower() for k in ("reduce", "improve", "increase", "avoid", "decrease", "enhance", "ensure")
+    )
+    has_biz = any(k in candidate for k in BIZ_HINTS) or any(
+        k in candidate.lower() for k in ("revenue", "cost", "risk", "brand", "market", "efficiency", "reputation", "quality")
+    )
+    return has_who and has_benefit and has_biz
 
 
 def _sanitize_user_desc(text: str) -> str:
     sanitized = (text or "").strip()
-    blocked = ["评分标准", "教材第", "问题项", "第1项", "第2项", "第3项", "第4项", "第5项", "第6项", "第7项", "第8项", "第9项", "第10项", "第11项", "第12项", "第13项", "第14项"]
+    blocked = [
+        "评分标准", "教材第", "问题项",
+        "第1项", "第2项", "第3项", "第4项", "第5项",
+        "第6项", "第7项", "第8项", "第9项", "第10项",
+        "第11项", "第12项", "第13项", "第14项",
+    ]
     for token in blocked:
         sanitized = sanitized.replace(token, "")
     return sanitized.strip("：:，,。 ") or "当前表达还有一层关键信息不够具体。"
@@ -151,66 +215,105 @@ def _extract_value_text(row_data: dict[str, Any]) -> str:
     return " ".join(texts)
 
 
-def _passes_three_questions(text: str) -> bool:
-    candidate = (text or "").strip()
-    if not candidate:
-        return False
-    has_who = any(k in candidate for k in WHO_HINTS)
-    has_benefit = any(k in candidate for k in BENEFIT_HINTS)
-    has_biz = any(k in candidate for k in BIZ_HINTS)
-    return has_who and has_benefit and has_biz
+def _format_value_for_view(value: Any) -> str:
+    if isinstance(value, list):
+        items = []
+        for idx, task in enumerate(value, 1):
+            task_parts = [f"{k}: {v}" for k, v in task.items() if v]
+            if task_parts:
+                items.append(f"{idx}. {' | '.join(task_parts)}")
+        return "\n".join(items)
+    return str(value)
 
+
+def _pick_related_fields(row_data: dict[str, Any], issue: dict[str, Any]) -> list[str]:
+    desc = f"{issue.get('category', '')} {issue.get('issue_desc', '')} {issue.get('explanation', '')}".lower()
+    non_empty_keys = [k for k, v in row_data.items() if v]
+    if not non_empty_keys:
+        return []
+    ranked: list[str] = []
+    keywords = [
+        ("岗位价值", ["岗位价值", "价值", "客户", "商业"]),
+        ("岗位效能", ["岗位效能", "效能", "指标", "量化"]),
+        ("核心任务", ["核心任务", "任务", "目的", "成果"]),
+        ("辅助任务", ["辅助任务", "任务", "目的", "成果"]),
+    ]
+    for key in non_empty_keys:
+        score = 0
+        for _, hints in keywords:
+            if any(h in key for h in hints):
+                score += 1
+            if any(h in desc for h in hints) and any(h in key for h in hints):
+                score += 2
+        if "资源投入" in key:
+            score -= 1
+        if score > 0:
+            ranked.append((score, key))
+    if ranked:
+        ranked.sort(key=lambda x: (-x[0], x[1]))
+        return [k for _, k in ranked[:3]]
+    return non_empty_keys[:2]
+
+
+# ─────────────────────────────────────────────────────────────
+# 灰区放过逻辑
+# ─────────────────────────────────────────────────────────────
 
 def _should_relax_issue(item_id: int, row_data: dict[str, Any], issue: dict[str, Any]) -> bool:
     """
-    灰区放过逻辑 - 基于 skill 中的严格度校准对照表
-
-    判定原则：三问法都过 → 合格放过；灰色地带默认放过
+    灰区放过逻辑 - 基于严格度校准对照表
+    三问法都过 → 合格放过；灰色地带默认放过
     """
-    # 岗位价值相关项（1-4）：若已通过三问法，则不进入引导清单
     if item_id in {1, 2, 3, 4}:
         value_text = _extract_value_text(row_data)
         if _passes_three_questions(value_text):
             return True
 
-    # 岗位效能（5）：若效能与价值关键词能对上，放过
     if item_id == 5:
         value_text = _extract_value_text(row_data)
         eff_text = str(row_data.get("岗位效能", "") or row_data.get("岗位效能_", ""))
-        # 简单检查：效能不为空且包含量化指标关键词
         if eff_text and any(k in eff_text for k in ("%", "率", "次", "个", "小时", "天", "数量", "≤", ">=")):
             return True
 
-    # 任务命名 B级问题（7-8）：边界问题描述轻微时放过
     if item_id in {7, 8}:
         desc = (issue.get("issue_desc") or "") + (issue.get("explanation") or "")
-        # 描述中有"轻微"、"偶有"等词，或任务名仍符合动宾结构
         if "轻微" in desc or "偶有" in desc:
             return True
         task_names = []
         for k, v in row_data.items():
             if "任务" in k and v and isinstance(v, str):
                 task_names.append(v)
-        # 如果任务名包含动词，基本可用
         verbs = ("负责", "完成", "制定", "整理", "分析", "设计", "开发", "测试", "评审", "编写")
         if task_names and any(v in task_names[0] for v in verbs):
             return True
 
-    # 任务目的与成果（9-14）：主要目的有支撑则放过
     if item_id in {9, 10, 11, 12, 13, 14}:
-        # 检查是否有明确的成果指标
         outcome_text = ""
         for k, v in row_data.items():
             if "成果" in k and v:
                 outcome_text += str(v)
-        # 有具体指标则放过
         if any(k in outcome_text for k in ("%", "率", "次", "个", "≤", ">=", "内", "以上")):
             return True
 
     return False
 
 
-def _normalize_matched_issues(matched_issues: list[dict[str, Any]], row_data: dict[str, Any]) -> tuple[list[dict[str, Any]], list[int]]:
+def _coerce_rubric_item_id(raw: Any) -> Optional[int]:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if not digits:
+        return None
+    item_id = int(digits)
+    return item_id if item_id in RUBRIC_INDEX else None
+
+
+def _normalize_matched_issues(
+    matched_issues: list[dict[str, Any]], row_data: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[int]]:
     normalized: list[dict[str, Any]] = []
     relaxed_ids: list[int] = []
 
@@ -229,9 +332,10 @@ def _normalize_matched_issues(matched_issues: list[dict[str, Any]], row_data: di
             "level": "A" if level.upper() == "A" else "B",
             "deduction": deduction,
             "explanation": raw.get("explanation", ""),
-            "user_facing_desc": _sanitize_user_desc(raw.get("user_facing_desc") or raw.get("issue_desc") or canonical["desc"]),
+            "user_facing_desc": _sanitize_user_desc(
+                raw.get("user_facing_desc") or raw.get("issue_desc") or canonical["desc"]
+            ),
         }
-
         if _should_relax_issue(item_id, row_data, issue):
             relaxed_ids.append(item_id)
             continue
@@ -241,33 +345,11 @@ def _normalize_matched_issues(matched_issues: list[dict[str, Any]], row_data: di
     return normalized, sorted(set(relaxed_ids))
 
 
-def _build_escalation_question(issue: dict[str, Any], row_data: dict[str, Any], hint_level: int) -> str:
-    related_fields = issue.get("related_fields", [])
-    field_name = related_fields[0] if related_fields else "当前描述"
-    current_text = str(row_data.get(field_name, "")) if field_name in row_data else ""
-
-    if hint_level <= 1:
-        return f"如果只改 {field_name} 这一处，你会先补哪一个可验证信息，能让评审一眼看到变化？"
-    if hint_level == 2:
-        return (
-            f"给你一个更具体的抓手：围绕 {field_name}，先补'服务对象'、'可观察结果'、'业务影响'三者中的哪一项？"
-        )
-    return (
-        f"我们再收窄一步：基于你现在这句“{current_text[:60]}”，你愿意先把它改成“为谁带来什么具体结果”的一句话吗？"
-    )
-
 # ─────────────────────────────────────────────────────────────
-# 辅助：构建系统提示（五条铁律）
+# 构建系统提示（五条铁律）
 # ─────────────────────────────────────────────────────────────
+
 def _build_system_prompt(scoring_criteria: str, teaching_material: str) -> str:
-    """
-    构建系统提示，遵循五条铁律：
-    1. 【不直接给答案】永远不直接告诉用户"应该写什么"
-    2. 【严格依据评分标准】逐条对照14项评分标准
-    3. 【教材仅作背景】引导和回答基于教材，但场景一不直接贴原文
-    4. 【每次聚焦一点】每轮对话只聚焦一个问题
-    5. 【正向激励】先认可做得好的地方，再指出需完善的地方
-    """
     return f"""你是一名专业的岗标辅导专家，帮助员工完善"岗标价值与岗标任务"表格。
 
 ## 你的辅导原则（五条铁律）
@@ -304,6 +386,12 @@ def _build_system_prompt(scoring_criteria: str, teaching_material: str) -> str:
 
 **灰色地带默认放过**——标准没明文覆盖的不主动找事。
 
+**真实反例**：
+{REAL_EXAMPLE}
+
+## 严格度校准对照表
+{json.dumps(STRICTNESS_TABLE, ensure_ascii=False, indent=2)}
+
 ---
 
 ### 评审打分标准
@@ -314,133 +402,9 @@ def _build_system_prompt(scoring_criteria: str, teaching_material: str) -> str:
 """
 
 
-def _safe_json_load(raw: str, fallback: dict) -> dict:
-    """兼容模型输出 markdown 代码块。"""
-    cleaned = raw.strip()
-    if "```" in cleaned:
-        cleaned = cleaned.split("```")[1]
-        if cleaned.startswith("json"):
-            cleaned = cleaned[4:]
-    try:
-        return json.loads(cleaned.strip())
-    except Exception:
-        return fallback
-
-
-def _is_question_intent(text: str) -> bool:
-    stripped = (text or "").strip()
-    if not stripped:
-        return False
-    return any(h in stripped for h in QUESTION_HINTS)
-
-
-def _is_reply_intent(text: str) -> bool:
-    stripped = (text or "").strip()
-    if not stripped:
-        return False
-    return any(h in stripped for h in REPLY_HINTS)
-
-
-def _rule_based_intent(text: str) -> tuple[str, float]:
-    """规则优先：明显问句/明显作答直接判定，其余交给 LLM。"""
-    stripped = (text or "").strip()
-    if not stripped:
-        return "reply", 0.6
-
-    q = _is_question_intent(stripped)
-    r = _is_reply_intent(stripped)
-
-    if q and not r:
-        return "question", 0.85
-    if r and not q:
-        return "reply", 0.8
-    if q and r:
-        return "uncertain", 0.4
-
-    # 陈述句兜底为作答倾向，但置信度较低，触发 LLM 二判
-    return "reply", 0.55
-
-
-def _llm_intent_fallback(state: CoachState, user_text: str) -> str:
-    """二判：当规则不稳定时，用轻量 LLM 分类 reply/question。"""
-    system = _build_system_prompt(
-        state.get("scoring_criteria", MOCK_SCORING_CRITERIA),
-        state.get("teaching_material", MOCK_TEACHING_MATERIAL),
-    )
-    prompt = f"""请判断用户最新输入意图。
-
-当前阶段: {state.get('phase', 'guiding')}
-当前待引导问题: {state.get('pending_question', '')}
-用户输入: {user_text}
-
-分类标准:
-1. intent=reply: 用户在回答当前引导问题或给出修改思路
-2. intent=question: 用户在主动发起新的咨询问题（解释/方法/示例等）
-
-仅输出 JSON:
-{{"intent":"reply或question","confidence":0.0}}
-"""
-    if not _is_llm_enabled():
-        return "reply"
-
-    try:
-        llm = _get_llm()
-        if llm is None:
-            return "reply"
-        resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=prompt)])
-    except Exception:
-        return "reply"
-
-    parsed = _safe_json_load(resp.content, {"intent": "reply", "confidence": 0.5})
-    intent = str(parsed.get("intent", "reply")).strip().lower()
-    if intent not in {"reply", "question"}:
-        return "reply"
-    return intent
-
-
-def _format_value_for_view(value: Any) -> str:
-    if isinstance(value, list):
-        items = []
-        for idx, task in enumerate(value, 1):
-            task_parts = [f"{k}: {v}" for k, v in task.items() if v]
-            if task_parts:
-                items.append(f"{idx}. {' | '.join(task_parts)}")
-        return "\n".join(items)
-    return str(value)
-
-
-def _pick_related_fields(row_data: dict[str, Any], issue: dict[str, Any]) -> list[str]:
-    """根据问题描述抽取最相关字段，至少返回 1 个字段。"""
-    desc = f"{issue.get('category', '')} {issue.get('issue_desc', '')} {issue.get('explanation', '')}".lower()
-    non_empty_keys = [k for k, v in row_data.items() if v]
-    if not non_empty_keys:
-        return []
-
-    ranked: list[str] = []
-    keywords = [
-        ("岗位价值", ["岗位价值", "价值", "客户", "商业"]),
-        ("岗位效能", ["岗位效能", "效能", "指标", "量化"]),
-        ("核心任务", ["核心任务", "任务", "目的", "成果"]),
-        ("辅助任务", ["辅助任务", "任务", "目的", "成果"]),
-    ]
-    for key in non_empty_keys:
-        score = 0
-        for _, hints in keywords:
-            if any(h in key for h in hints):
-                score += 1
-            if any(h in desc for h in hints) and any(h in key for h in hints):
-                score += 2
-        if "资源投入" in key:
-            score -= 1
-        if score > 0:
-            ranked.append((score, key))
-
-    if ranked:
-        ranked.sort(key=lambda x: (-x[0], x[1]))
-        return [k for _, k in ranked[:3]]
-
-    return non_empty_keys[:2]
-
+# ─────────────────────────────────────────────────────────────
+# 引导问题生成
+# ─────────────────────────────────────────────────────────────
 
 def _generate_issue_question(
     scoring_criteria: str,
@@ -448,574 +412,554 @@ def _generate_issue_question(
     row_data: dict[str, Any],
     issue: dict[str, Any],
 ) -> str:
-    """
-    为当前问题项生成单一聚焦引导问题。
-    根据问题类别引用教材示例，用苏格拉底式提问引导用户。
-    """
-    system = _build_system_prompt(scoring_criteria, teaching_material)
-
-    # 获取问题类别和ID
-    category = issue.get("category", "")
+    """为当前问题项生成单一聚焦引导问题（优先使用引导武器表）"""
     rubric_item_id = issue.get("rubric_item_id", 0)
+    weapon = GUIDANCE_WEAPONS.get(str(rubric_item_id))
 
-    # 构建教材示例引用
-    example_context = ""
-    if category in TEXTBOOK_EXAMPLES:
-        examples = TEXTBOOK_EXAMPLES[category]
-        if "正例" in examples:
-            example_context += f"\n教材正例：{examples['正例']}\n"
-        if "测试工程师例子" in examples:
-            example_context += f"\n教材示例：{examples['测试工程师例子']}\n"
-        if "命名格式" in examples:
-            example_context += f"\n格式要求：{examples['命名格式']}\n"
-        if "客服例子" in examples:
-            example_context += f"\n教材案例：{examples['客服例子']}\n"
+    if weapon and _is_llm_enabled():
+        # 有对应的引导武器，让 LLM 基于武器风格 + 教材生成自然的问题
+        system = _build_system_prompt(scoring_criteria, teaching_material)
+        category = issue.get("category", "")
+        user_desc = issue.get("user_facing_desc", issue.get("issue_desc", ""))
 
-    prompt = f"""请针对当前问题项生成一个苏格拉底式引导问题。
+        # 找到对应自检问
+        self_check = None
+        for q in SELF_CHECK_QUESTIONS:
+            if q["id"] == str(rubric_item_id) or any(
+                keyword in category for keyword in q["mistake"]
+            ):
+                self_check = q
+                break
 
-当前条目：
-{json.dumps(row_data, ensure_ascii=False)}
+        prompt = f"""基于以下引导武器风格，生成一个自然的苏格拉底式引导问题。
 
-当前问题项：
-{json.dumps(issue, ensure_ascii=False)}
-{example_context}
+当前问题类别：{category}
+问题描述：{user_desc}
+引导武器风格：{weapon['question_style']}
+教材参考：{weapon['textbook_ref']}
+"""
+        if self_check:
+            prompt += f"\n自检问参考：{self_check['check']}"
+
+        prompt += """
+
 要求：
-1. **只问一个问题** - 每次聚焦一个点
-2. **不给答案** - 用提问"钓"出答案
-3. **先肯定再切入** - 每轮开头认可一个具体优点
-4. **引用教材示例** - 用教材中的具体案例帮助理解（但用人话表达，不标出处）
-5. **问题要具体** - 可直接促使用户修改当前问题项
+1. 用自然的口语，像老同事在茶水间聊天那样
+2. 不报章节号、不报条目编号
+3. 一次只聚焦一个点
+4. 先指出做得好的地方，再引出问题
+5. 用提问引导用户自己想，不给答案
 
-生成策略：
-- 岗位价值问题：引导用户明确"为谁创造什么价值"
-- 岗位效能问题：引导用户找到与价值对应的衡量指标
-- 岗位任务问题：引导用户按"动词+修饰语+名词"格式命名
-- 任务目的与成果问题：引导用户区分交付物和实际成果
+直接输出问题文本，不要 JSON 格式。"""
 
-仅输出 JSON：
-{{"question":"..."}}"""
+        try:
+            llm = _get_llm()
+            if llm is None:
+                raise Exception("LLM not available")
+            resp = llm.invoke([
+                SystemMessage(content=system),
+                HumanMessage(content=prompt),
+            ])
+            return resp.content.strip()
+        except Exception:
+            pass
 
-    if not _is_llm_enabled():
-        return _generate_fallback_question(category, rubric_item_id)
+    # 兜底：使用引导武器表的默认话术
+    if weapon:
+        return weapon["question_style"]
 
-    try:
-        llm = _get_llm()
-        if llm is None:
-            return _generate_fallback_question(category, rubric_item_id)
-        resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=prompt)])
-    except Exception:
-        return _generate_fallback_question(category, rubric_item_id)
-
-    parsed = _safe_json_load(resp.content, {"question": _generate_fallback_question(category, rubric_item_id)})
-    return parsed.get("question", _generate_fallback_question(category, rubric_item_id))
-
-
-def _generate_fallback_question(category: str, rubric_item_id: int) -> str:
-    """根据问题类别返回兜底引导问题"""
-    if category == "岗位价值":
-        if rubric_item_id in {1, 2}:
-            return "这个价值描述是从客户视角出发的吗？你最直接服务的客户是谁，他能从你这里获得什么具体好处？"
-        elif rubric_item_id == 3:
-            return "不同客户的需求是否都一样？如果不一样，你觉得需要怎么区分？"
-        else:
-            return "如果只改这一处，你会先补哪一个可验证信息，能让评审一眼看到变化？"
-    elif category == "岗位效能":
-        return "对应这个岗位价值，客户视角下能观察到的结果是什么？怎么衡量？"
-    elif category == "岗位任务":
-        if rubric_item_id == 7:
-            return "任务命名格式是：动词+修饰语+名词。比如'整理客户拜访纪要'——你现在的任务名能改成这种格式吗？"
-        elif rubric_item_id == 8:
-            return "这个名字说的是'想要什么结果'，而不是'要做什么动作'——能感觉到区别吗？"
-        else:
-            return "核心任务是否完整覆盖了岗位价值？还有哪个价值点没有对应到任务？"
-    elif category == "任务目的与成果":
-        if rubric_item_id == 9:
-            return "如果有人问你这个任务到底'为啥要做'，你能一句话说清吗？"
-        elif rubric_item_id == 10:
-            return "你写的成果，真的能证明这个目的达到了吗？"
-        elif rubric_item_id == 13:
-            return "交了文档和达到目的，是一回事吗？"
-        else:
-            return "这个指标，换个人来量，能得出一样的数吗？"
-    return "如果你现在就改这一处，你会先补充哪条最具体、可验证的信息？"
-
-
-def _mock_review_result(row_data: dict[str, Any]) -> dict[str, Any]:
-    """无外部模型时的轻量评审兜底，保证流程可运行。"""
-    issues: list[dict[str, Any]] = []
-    value_text = str(row_data.get("岗位价值", "") or row_data.get("岗位价值_", ""))
-    eff_text = str(row_data.get("岗位效能", "") or row_data.get("岗位效能_", ""))
-
-    if ("负责" in value_text) or (not value_text.strip()):
-        issues.append(
-            {
-                "issue_id": "1",
-                "issue_desc": "岗位价值表达偏动作化，客户价值不够明确",
-                "category": "岗位价值",
-                "level": "B",
-                "deduction": 5,
-                "explanation": "当前描述更像职责罗列，缺少“为谁创造什么价值”的表达。",
-                "user_facing_desc": "当前岗位价值更像在描述你做了什么，还没有清晰体现你为谁创造了什么价值。",
-            }
-        )
-
-    if (eff_text.strip() == "") or (eff_text.strip() in {"无", "N/A", "NA"}):
-        issues.append(
-            {
-                "issue_id": "5",
-                "issue_desc": "岗位效能缺少可衡量指标",
-                "category": "岗位效能",
-                "level": "B",
-                "deduction": 5,
-                "explanation": "当前效能栏位没有体现可观察结果。",
-                "user_facing_desc": "当前岗位效能还看不出可衡量结果，建议补充可验证指标。",
-            }
-        )
-
-    return {
-        "matched_issues": issues,
-        "score": max(0, 100 - sum(i.get("deduction", 0) for i in issues)),
-        "teaching_refs": ["离线模式：使用本地规则评审。"],
-    }
+    # 最终兜底
+    return "你觉得这个地方还能怎么写得更有说服力？"
 
 
 def _build_proactive_message(
-    idx: int,
-    total: int,
-    row_data: dict[str, Any],
-    issue: dict[str, Any],
-    question: str,
+    idx: int, total: int, row_data: dict[str, Any],
+    issue: dict[str, Any], question: str,
 ) -> str:
-    """
-    场景一固定四段式输出。
-    遵循每轮对话结构：
-    1. 【肯定】指出做得好的具体点
-    2. 【切入】用自然的话点出问题
-    3. 【引用教材示例】用人话表达，不标出处
-    4. 【一问】抛出引导问题
-    """
-    related_fields = issue.get("related_fields", [])
+    """构建主动引导消息（每轮对话结构：肯定 → 切入 → 一问）"""
     category = issue.get("category", "")
-    user_facing_desc = issue.get("user_facing_desc", "当前条目存在需完善的问题。")
+    user_desc = issue.get("user_facing_desc", issue.get("issue_desc", ""))
 
-    # 提取关联内容展示
-    related_lines: list[str] = []
-    for key in related_fields:
-        if key in row_data and row_data.get(key):
-            related_lines.append(f"- {key}: {_format_value_for_view(row_data[key])}")
-    if not related_lines:
-        related_lines = ["- （当前问题项暂无明确关联字段，建议先补充关键描述）"]
-    related_block = "\n".join(related_lines)
+    # 尝试找一条做得好的点
+    highlight = ""
+    for key, val in row_data.items():
+        if val and isinstance(val, str) and len(val) > 5:
+            highlight = f"你{key}这块写得挺实在的，"
+            break
+    if not highlight:
+        highlight = "材料整体框架是清晰的，"
 
-    # 根据问题类别生成肯定语和教材引用
-    affirmation = _generate_affirmation(category, row_data)
-    textbook_ref = _generate_textbook_reference(category, issue)
-
-    return (
-        f"---\n"
+    content = (
         f"📋 第 {idx+1}/{total} 条\n\n"
-        f"【肯定】\n"
-        f"{affirmation}\n\n"
-        f"【关联内容】\n"
-        f"{related_block}\n\n"
-        f"【需要关注的点】\n"
-        f"{user_facing_desc}\n\n"
-        f"【教材参考】\n"
-        f"{textbook_ref}\n\n"
-        f"【引导性问题】\n"
+        f"✅ {highlight}我们来看一个可以更精准的地方。\n\n"
         f"💬 {question}"
     )
+    return content
 
 
-def _generate_affirmation(category: str, row_data: dict[str, Any]) -> str:
-    """生成肯定语，指出做得好的具体点"""
-    if category == "岗位价值":
-        # 检查是否有客户视角
-        value_text = _extract_value_text(row_data)
-        if any(k in value_text for k in WHO_HINTS):
-            return "你已经明确了服务对象，这是很好的起点。"
-        return "你开始思考岗位价值了，这个方向是对的。"
-    elif category == "岗位效能":
-        return "你有意识地为岗位价值寻找衡量方式，这是值得肯定的。"
-    elif category == "岗位任务":
-        return "你的任务命名已经有了动作感，下一步可以让它更具体。"
-    elif category == "任务目的与成果":
-        return "你开始思考任务的目的了，这比只列动作要深入。"
-    return "你在这个条目上已经有了基础框架，我们继续打磨。"
+def _build_escalation_question(
+    issue: dict[str, Any], row_data: dict[str, Any], hint_level: int
+) -> str:
+    """卡住时升级提示（3 级递进）"""
+    related_fields = issue.get("related_fields", [])
+    field_name = related_fields[0] if related_fields else "当前描述"
+    current_text = str(row_data.get(field_name, "")) if field_name in row_data else ""
 
-
-def _generate_textbook_reference(category: str, issue: dict[str, Any]) -> str:
-    """生成教材引用，用人话表达，不标出处"""
-    rubric_item_id = issue.get("rubric_item_id", 0)
-
-    if category == "岗位价值":
-        if rubric_item_id in {1, 2}:
-            return "岗位价值的本质是为谁创造价值 + 创造何种具体价值。测试工程师的例子值得参考：对产品经理的价值是'减少缺陷流出，避免口碑拖累市场推广'——先说服务对象，再说能让对方获得什么具体的商业结果。"
-        elif rubric_item_id == 3:
-            return "多个岗位混在一起时，需要思考每个岗位对这个岗位的需求是不是都一样。如果不一样，可能需要拆分成不同的客户群体。"
-        else:
-            return "岗位价值要避免空泛的描述，需要体现这个岗位的独一无二的客户期待。"
-    elif category == "岗位效能":
-        return "岗位效能是岗位价值的可视化脉络，必须与价值一一对应、同频共振。比如价值是'减少缺陷流出'，对应效能可以是'缺陷泄漏率≤0.5%'。"
-    elif category == "岗位任务":
-        if rubric_item_id == 7:
-            return "任务命名格式建议用'动词+修饰语+名词'，比如'整理客户拜访纪要'——这样可以让大家直接理解'做什么'和'如何入手'。"
-        elif rubric_item_id == 8:
-            return "用目的命名任务（比如'降低产品成本'）只标出了终点，但未指引行动。任务名应该让人一看就知道要做什么动作。"
-        else:
-            return "核心任务是对岗位价值有直接和强力支撑的任务。"
-    elif category == "任务目的与成果":
-        if rubric_item_id == 9:
-            return "任务目的要能说清'为啥要做'。客服的例子：从'5分钟内首次响应'校准为'一次性彻底解决用户疑问'后，效果会更清晰。"
-        elif rubric_item_id == 13:
-            return "交付物和实际成果不是一回事。高效委派要明确目的（解决什么问题）和成果（达到什么指标），而不是只说要交付什么文档。"
-        else:
-            return "成果要符合SMART原则，避免把交付物当成果。"
-    return "可以参考教材中的相关案例来理解这个问题。"
-
+    if hint_level <= 1:
+        return f"如果只改 {field_name} 这一处，你会先补哪一个可验证信息，能让评审一眼看到变化？"
+    if hint_level == 2:
+        return (
+            f"给你一个更具体的抓手：围绕 {field_name}，"
+            "先补‘服务对象’、‘可观察结果’、‘业务影响’三者中的哪一项？"
+        )
+    # hint_level >= 3: most specific hint
+    text_preview = current_text[:60]
+    lq = "\u201c"  # left double quote
+    rq = "\u201d"  # right double quote
+    return (
+        f"我们再收窄一步：基于你现在这句{lq}{text_preview}{rq}，"
+        f"你愿意先把它改成{lq}为谁带来什么具体结果{rq}的一句话吗？"
+    )
 
 def _advance_to_next_item(state: CoachState, feedback: str) -> dict:
-    """当前条目问题全部解决后，切到下一条或完成态。"""
+    """推进到下一个条目或进入收尾"""
     idx = state["current_item_index"]
     rows = state["submission_rows"]
     next_idx = idx + 1
-    is_last = next_idx >= len(rows)
 
-    if is_last:
-        closure_summary = "本轮已完成全部条目引导，后续进入答疑模式。"
-        msg = AIMessage(content=(
-            f"✅ {feedback}\n\n"
-            "🎉 当前评审条目已全部完成。\n"
-            "后续若你有问题，可继续直接提问，我会进入被动答疑模式。"
-        ))
+    if next_idx >= len(rows):
         return {
-            "messages": [msg],
-            "current_item_index": next_idx,
             "phase": "done",
-            "active_mode": "reactive_qa",
-            "awaiting_user_input": True,
-            "pending_question": None,
-            "stuck_counter": 0,
-            "hint_level": 0,
-            "closure_summary": closure_summary,
+            "current_item_index": next_idx,
+            "messages": [AIMessage(content=f"✅ {feedback}\n\n所有条目已辅导完毕！")],
+            "active_mode": "proactive",
+            "awaiting_user_input": False,
         }
 
-    msg = AIMessage(content=(
-        f"✅ {feedback}\n\n"
-        f"---\n继续进入第 {next_idx + 1}/{len(rows)} 条，我们保持一次只聚焦一个问题。"
-    ))
     return {
-        "messages": [msg],
         "current_item_index": next_idx,
+        "current_issue_index": 0,
+        "issue_round": 0,
         "phase": "reviewing",
         "active_mode": "proactive",
-        "reflection_round": 0,
-        "issue_round": 0,
-        "current_issue_index": 0,
-        "awaiting_user_input": False,
+        "pending_question": "",
+        "messages": [AIMessage(content=f"✅ {feedback}\n\n我们来看下一条。")],
         "stuck_counter": 0,
         "hint_level": 0,
-        "current_focus_id": None,
+        "awaiting_user_input": False,
     }
 
 
 # ─────────────────────────────────────────────────────────────
-# NODE 1: load_standards
-# 启动时预加载评审标准（评分标准xlsx + 教材PDF）
+# NODE 0: load_standards — 加载评审标准 + 检查进度
 # ─────────────────────────────────────────────────────────────
+
 def load_standards(state: CoachState) -> dict:
     """
-    预加载评分标准 xlsx 和教材 PDF。
-    路径从环境变量读取，不存在则用 Mock 数据（便于测试）。
+    初始化：加载评分标准和教材，检查是否有已保存的进度。
+    对应 skill 阶段 0 的初始化 + 进度恢复检测。
     """
-    print("[Node] load_standards: 加载评审标准...")
+    scoring_criteria = _load_rubric_text()
+    teaching_material = _load_textbook_text()
 
-    criteria_path = os.environ.get("SCORING_CRITERIA_PATH", "")
-    teaching_path = os.environ.get("TEACHING_MATERIAL_PATH", "")
+    # 检查进度
+    progress = _call_progress_script("show")
+    has_saved = progress is not None and progress.get("file")
 
-    # 加载评分标准
-    if criteria_path and os.path.exists(criteria_path):
-        scoring_criteria = load_scoring_criteria(criteria_path)
-        print(f"  ✓ 已加载评分标准: {criteria_path}")
-    else:
-        scoring_criteria = MOCK_SCORING_CRITERIA
-        print("  ⚠ 使用 Mock 评分标准（设置 SCORING_CRITERIA_PATH 可指定真实文件）")
+    if has_saved:
+        welcome = (
+            "嘿，我看到你上次有做到一半的辅导记录——"
+            "要不要接着上次的来？还是重新开始？"
+        )
+        return {
+            "scoring_criteria": scoring_criteria,
+            "teaching_material": teaching_material,
+            "phase": "loaded",
+            "has_saved_progress": True,
+            "progress_snapshot": progress,
+            "messages": [AIMessage(content=welcome)],
+        }
 
-    # 加载教材 PDF
-    if teaching_path and os.path.exists(teaching_path):
-        teaching_material = load_pdf_as_text(teaching_path)
-        print(f"  ✓ 已加载教材: {teaching_path}")
-    else:
-        teaching_material = MOCK_TEACHING_MATERIAL
-        print("  ⚠ 使用 Mock 教材（设置 TEACHING_MATERIAL_PATH 可指定真实文件）")
-
-    welcome_msg = AIMessage(content=(
-        "👋 欢迎使用岗标辅导系统！\n\n"
-        "请上传您的 **岗标价值与岗标任务** 表格（.xlsx 格式），"
-        "我将逐项引导您完善每个条目 📋"
-    ))
-
+    welcome = "来，先把你的材料给我看看——把《岗位价值与岗位任务》那个 Excel 的路径发我就行。"
     return {
         "scoring_criteria": scoring_criteria,
         "teaching_material": teaching_material,
         "phase": "loaded",
-        "active_mode": "proactive",
-        "last_user_intent": "reply",
-        "messages": [welcome_msg],
-        "review_items": [],
-        "current_item_index": 0,
-        "reflection_round": 0,
-        "issue_round": 0,
-        "current_issue_index": 0,
-        "issue_status_map": {},
-        "awaiting_user_input": True,
-        "rubric_eval_summary": {
-            "checked_item_ids": [item["id"] for item in RUBRIC_ITEMS],
-            "matched_item_ids": [],
-            "relaxed_item_ids": [],
-            "coverage_ok": False,
-        },
-        "coaching_queue_order": [],
-        "current_focus_id": None,
-        "stuck_counter": 0,
-        "hint_level": 0,
-        "closure_summary": None,
+        "has_saved_progress": False,
+        "messages": [AIMessage(content=welcome)],
     }
 
 
 # ─────────────────────────────────────────────────────────────
-# NODE 2: parse_submission
-# 解析用户上传的表格，提取结构化数据
+# NODE 1: validate_structure — 结构校验 + 内容提取
+# 对应 skill 阶段 1：validate_sheets.py --extract
 # ─────────────────────────────────────────────────────────────
-def parse_submission(state: CoachState) -> dict:
-    """解析用户提交的 xlsx，提取列和行数据"""
-    path = state.get("submission_path", "")
-    print(f"[Node] parse_submission: 解析文件 {path}")
 
-    if not path or not os.path.exists(path):
-        # 使用 Mock 数据测试
-        path = _create_mock_submission()
-        print(f"  ⚠ 使用 Mock 提交文件: {path}")
+def validate_structure(state: CoachState) -> dict:
+    """
+    结构校验：用 validate_sheets.py 校验文件结构是否完整，
+    通过后提取结构化数据，否则告知用户缺少哪些区块。
+    """
+    file_path = state.get("submission_path", "")
+    if not file_path:
+        # 尝试创建 mock 文件
+        file_path = _create_mock_submission()
 
-    columns, rows, submission_text = load_submission(path)
+    # 调用校验脚本
+    result = _call_validate_script(file_path, extract=True)
 
-    # 根据是否为分组结构生成不同的消息
-    has_tasks = any(isinstance(row.get("核心任务"), list) for row in rows)
-    if has_tasks:
-        core_count = sum(len(row.get("核心任务", [])) for row in rows)
-        aux_count = sum(len(row.get("辅助任务", [])) for row in rows)
-        msg = AIMessage(content=(
-            f"✅ 已成功解析您的表格！\n\n"
-            f"📊 共识别到 **{len(rows)} 个岗位价值条目**，包含：\n"
-            f"  • 核心任务 **{core_count}** 项\n"
-            f"  • 辅助任务 **{aux_count}** 项\n\n"
-            "接下来我将逐条引导您完善，我们一起来把这份表格打磨得更完整 💪\n\n"
-            "准备好了吗？我们从第一条开始👇"
-        ))
-    else:
-        msg = AIMessage(content=(
-            f"✅ 已成功解析您的表格！\n\n"
-            f"📊 共识别到 **{len(rows)} 个条目**，列结构如下：\n"
-            f"`{'` → `'.join(columns)}`\n\n"
-            "接下来我将逐条引导您完善，我们一起来把这份表格打磨得更完整 💪\n\n"
-            "准备好了吗？我们从第一条开始👇"
-        ))
+    if result is None:
+        # 脚本不可用，回退到内部解析
+        return _fallback_validate(state, file_path)
+
+    if not result.get("ok"):
+        # validate_sheets.py may not handle all formats (e.g., merged cells).
+        # Fall back to internal load_submission which is more flexible.
+        return _fallback_validate(state, file_path)
+
+    # 校验通过，提取结构化数据
+    data = result.get("data", {})
+
+    # 将提取的数据转为 submission_rows 格式
+    columns, rows, text = _convert_extracted_data(data)
+
+    # 用自然的语气告诉用户
+    ai_msg = "收到，我先看一眼你的材料……好，结构完整，咱们开始吧。"
+
+    # 保存进度
+    _call_progress_script("init", file_path)
 
     return {
-        "submission_path": path,
-        "submission_text": submission_text,
+        "submission_path": file_path,
         "submission_columns": columns,
         "submission_rows": rows,
+        "submission_text": text,
+        "structure_valid": True,
+        "structure_errors": [],
         "phase": "reviewing",
-        "active_mode": "proactive",
-        "messages": [msg],
         "current_item_index": 0,
-        "current_issue_index": 0,
-        "issue_round": 0,
-        "review_items": [],
-        "stuck_counter": 0,
-        "hint_level": 0,
+        "messages": [AIMessage(content=ai_msg)],
+    }
+
+
+def _convert_extracted_data(data: dict) -> tuple[list[str], list[dict], str]:
+    """将 validate_sheets.py 提取的数据转为 submission_rows 格式"""
+    clients = data.get("clients", [])
+    aux_tasks = data.get("auxiliary_tasks", [])
+
+    columns = ["岗位价值", "岗位效能", "核心任务", "核心任务_资源投入", "辅助任务", "辅助任务_资源投入"]
+    rows: list[dict] = []
+
+    for client in clients:
+        row: dict[str, Any] = {
+            "岗位价值": client.get("position_value", ""),
+            "岗位效能": client.get("efficiency", ""),
+            "核心任务": client.get("tasks", []),
+            "辅助任务": [],
+        }
+        rows.append(row)
+
+    # 附加辅助任务到最后一个客户
+    if aux_tasks and rows:
+        rows[-1]["辅助任务"] = aux_tasks
+
+    # 生成文本摘要
+    lines = ["=== 提取的结构化数据 ===", ""]
+    for idx, client in enumerate(clients):
+        lines.append(f"客户{idx+1}：{client.get('name', '')}")
+        lines.append(f"  岗位价值：{client.get('position_value', '')}")
+        lines.append(f"  岗位效能：{client.get('efficiency', '')}")
+        for task in client.get("tasks", []):
+            lines.append(f"  核心任务：{task.get('name', '')} — {task.get('purpose_and_result', '')}")
+    for task in aux_tasks:
+        lines.append(f"  辅助任务：{task.get('name', '')} — {task.get('purpose_and_result', '')}")
+
+    text = "\n".join(lines)
+    return columns, rows, text
+
+
+def _fallback_validate(state: CoachState, file_path: str) -> dict:
+    """脚本不可用时的回退：直接使用内部 load_submission 解析"""
+    try:
+        columns, rows, text = load_submission(file_path)
+    except Exception as e:
+        return {
+            "structure_valid": False,
+            "structure_errors": [str(e)],
+            "messages": [AIMessage(content=f"文件读取失败：{e}")],
+            "phase": "loaded",
+        }
+
+    if not rows:
+        return {
+            "structure_valid": False,
+            "structure_errors": ["表格为空或格式无法识别"],
+            "messages": [AIMessage(content="这个文件好像读不出内容，能检查一下格式吗？")],
+            "phase": "loaded",
+        }
+
+    _call_progress_script("init", file_path)
+    return {
+        "submission_path": file_path,
+        "submission_columns": columns,
+        "submission_rows": rows,
+        "submission_text": text,
+        "structure_valid": True,
+        "structure_errors": [],
+        "phase": "reviewing",
+        "current_item_index": 0,
+        "messages": [AIMessage(content="材料收到了，我过了一遍，该有的都有——咱们直接进入正题。")],
     }
 
 
 # ─────────────────────────────────────────────────────────────
-# NODE 3: review_item
-# 对当前条目进行 AI 评审，生成结构化评审结果
+# NODE 2: review_item — 全面评审（后台，不暴露过程）
+# 对应 skill 阶段 2：严格逐条对照 14 项评分标准
 # ─────────────────────────────────────────────────────────────
+
 def review_item(state: CoachState) -> dict:
     """
-    对 current_item_index 对应的行进行评审，
-    生成 ReviewItem（含评分、问题、建议），存入 review_items。
-    不向用户直接展示评审结果，仅供内部使用。
+    对当前条目进行全面评审。
+    严格逐条对照 14 项评分标准，三问法筛选，灰区放过。
+    这是后台工作，评审过程不暴露给用户。
     """
     idx = state["current_item_index"]
     rows = state["submission_rows"]
-    columns = state["submission_columns"]
 
     if idx >= len(rows):
-        print(f"[Node] review_item: 所有条目已评审完毕")
         return {"phase": "done"}
 
     row_data = rows[idx]
-    print(f"[Node] review_item: 评审第 {idx+1}/{len(rows)} 条...")
+    columns = state["submission_columns"]
 
-    # 构建评审 Prompt
-    system = _build_system_prompt(
-        state["scoring_criteria"],
-        state["teaching_material"]
-    )
-    review_prompt = f"""请对以下岗标条目做内部评审（用户不可见）。
-
-必须完整检查如下 14 项，不得自定义维度：
-{_rubric_catalog_text()}
-
-评审约束：
-1. 逐条检查 14 项，并输出 checked_item_ids（必须覆盖 1-14）
-2. 命中问题项输出 matched_issues（仅保留明确会扣分的硬伤）
-3. 对于灰区问题，宁可放过，不进入 matched_issues
-4. user_facing_desc 只能是自然语言，不要出现编号、章节号、分数
-
-当前条目（第{idx+1}行）
-表格列定义：{' | '.join(columns)}
-{json.dumps(row_data, ensure_ascii=False, indent=2)}
-
-仅输出 JSON：
-{{
-    "checked_item_ids": [1,2,3,4,5,6,7,8,9,10,11,12,13,14],
-    "matched_issues": [
-        {{
-            "issue_id": "1-14",
-            "issue_desc": "问题描述",
-            "category": "岗位价值/岗位效能/岗位任务/任务目的与成果",
-            "level": "A或B",
-            "deduction": 10,
-            "explanation": "命中证据",
-            "user_facing_desc": "口语化问题描述，不含编号"
-        }}
-    ],
-    "teaching_refs": ["内部参考"]
-}}"""
+    # LLM 评审
+    matched_issues: list[dict[str, Any]] = []
+    checked_item_ids: list[int] = []
 
     if _is_llm_enabled():
-        try:
-            llm = _get_llm()
-            if llm is None:
-                result = _mock_review_result(row_data)
-            else:
-                response = llm.invoke([
-                    SystemMessage(content=system),
-                    HumanMessage(content=review_prompt),
-                ])
-                result = _safe_json_load(
-                    response.content,
-                    {
-                        "checked_item_ids": [item["id"] for item in RUBRIC_ITEMS],
-                        "matched_issues": [],
-                        "teaching_refs": ["请参考教材相关章节"],
-                    },
-                )
-        except Exception:
-            result = _mock_review_result(row_data)
+        matched_issues, checked_item_ids = _llm_review(
+            state["scoring_criteria"],
+            state["teaching_material"],
+            row_data,
+            columns,
+        )
     else:
-        result = _mock_review_result(row_data)
+        matched_issues, checked_item_ids = _rule_based_review(row_data)
 
-    checked_item_ids = sorted({
-        _coerce_rubric_item_id(v)
-        for v in result.get("checked_item_ids", [item["id"] for item in RUBRIC_ITEMS])
-        if _coerce_rubric_item_id(v) is not None
-    })
-    if len(checked_item_ids) != len(RUBRIC_ITEMS):
-        checked_item_ids = [item["id"] for item in RUBRIC_ITEMS]
+    # 标准化 + 灰区放过
+    normalized, relaxed_ids = _normalize_matched_issues(matched_issues, row_data)
 
-    matched_issues_raw = result.get("matched_issues", [])
-    matched_issues, relaxed_item_ids = _normalize_matched_issues(matched_issues_raw, row_data)
-    total_deduction = sum(item.get("deduction", 0) for item in matched_issues)
+    # 计算分数
+    total_deduction = sum(issue["deduction"] for issue in normalized)
     score = max(0, 100 - total_deduction)
 
+    # 构建 issue_queue（辅导顺序：岗位价值问题优先）
     issue_queue: list[dict[str, Any]] = []
-    issue_status_map = dict(state.get("issue_status_map", {}))
-    for item in matched_issues:
-        issue_id = item.get("issue_id", "unknown")
-        related_fields = _pick_related_fields(row_data, item)
-        user_desc = item.get("user_facing_desc") or item.get("issue_desc") or "当前条目存在需完善的问题。"
-        issue_queue.append(
-            {
-                "issue_id": issue_id,
-                "rubric_item_id": int(item.get("rubric_item_id", 0) or 0),
-                "issue_desc": item.get("issue_desc", ""),
-                "category": item.get("category", ""),
-                "status": "pending",
-                "related_fields": related_fields,
-                "user_facing_desc": user_desc,
-            }
-        )
-        issue_status_map[issue_id] = "pending"
+    for issue in normalized:
+        issue_queue.append({
+            "issue_id": issue["issue_id"],
+            "rubric_item_id": issue["rubric_item_id"],
+            "issue_desc": issue["user_facing_desc"],
+            "category": issue["category"],
+            "status": "pending",
+            "related_fields": _pick_related_fields(row_data, issue),
+            "user_facing_desc": issue["user_facing_desc"],
+        })
 
-    first_question = ""
+    # 岗位价值问题永远排最前
+    value_issues = [q for q in issue_queue if q["category"] == "岗位价值"]
+    other_issues = [q for q in issue_queue if q["category"] != "岗位价值"]
+    issue_queue = value_issues + other_issues
+
     if issue_queue:
         issue_queue[0]["status"] = "in_progress"
-        issue_status_map[issue_queue[0]["issue_id"]] = "in_progress"
+
+    # 保存 review item
+    review_items = list(state.get("review_items", []))
+    # 如果已有同索引的，更新；否则追加
+    if idx < len(review_items):
+        review_items[idx] = {
+            "row_index": idx,
+            "row_data": row_data,
+            "score": score,
+            "dimension_scores": {"matched_issues": normalized},
+            "issues": [i["issue_desc"] for i in normalized],
+            "suggestions": [],
+            "standard_ref": "",
+            "status": "reviewed",
+            "issue_queue": issue_queue,
+        }
+    else:
+        review_items.append({
+            "row_index": idx,
+            "row_data": row_data,
+            "score": score,
+            "dimension_scores": {"matched_issues": normalized},
+            "issues": [i["issue_desc"] for i in normalized],
+            "suggestions": [],
+            "standard_ref": "",
+            "status": "reviewed",
+            "issue_queue": issue_queue,
+        })
+
+    # 构建 coaching_queue_order（辅导队列）
+    coaching_queue_order = [q["issue_id"] for q in issue_queue]
+    current_focus_id = issue_queue[0]["issue_id"] if issue_queue else None
+
+    # 更新 issue_status_map
+    issue_status_map = dict(state.get("issue_status_map", {}))
+    for q in issue_queue:
+        issue_status_map[q["issue_id"]] = q["status"]
+
+    # 生成首个引导问题
+    first_question = ""
+    if issue_queue:
+        first_issue = issue_queue[0]
         first_question = _generate_issue_question(
             state["scoring_criteria"],
             state["teaching_material"],
             row_data,
-            issue_queue[0],
+            first_issue,
         )
-    else:
-        first_question = "这一条目目前没有命中问题项。你是否想主动优化其中某个部分？"
 
-    review_item_obj: ReviewItem = {
-        "row_index": idx + 1,
-        "row_data": row_data,
-        "score": score,
-        "dimension_scores": {"matched_issues": matched_issues},
-        "issues": [
-            f"[{item.get('category', '')}] {item.get('issue_desc', '')} ({item.get('level', '')}级)"
-            for item in matched_issues
-        ],
-        "suggestions": result.get("teaching_refs", []),
-        "standard_ref": result.get("teaching_refs", [""])[0] if result.get("teaching_refs") else "",
-        "status": "reflecting",
-        "issue_queue": issue_queue,
-    }
-
-    # 将评审结果追加到列表
-    existing = list(state.get("review_items", []))
-    existing.append(review_item_obj)
-
-    matched_item_ids = [int(item.get("rubric_item_id", 0) or 0) for item in matched_issues if int(item.get("rubric_item_id", 0) or 0) in RUBRIC_INDEX]
-    coaching_queue_order = [issue.get("issue_id", "") for issue in issue_queue]
+    print(f"[Node] review_item: 条目{idx+1}/{len(rows)}，发现{len(normalized)}个问题项，放过{len(relaxed_ids)}项，得分{score}")
 
     return {
-        "review_items": existing,
-        "pending_question": first_question,
-        "phase": "guiding",
-        "active_mode": "proactive",
+        "review_items": review_items,
+        "score": score,
+        "all_issues": normalized,
         "current_issue_index": 0,
         "issue_round": 0,
         "issue_status_map": issue_status_map,
-        "reflection_round": 0,
-        "rubric_eval_summary": {
-            "checked_item_ids": checked_item_ids,
-            "matched_item_ids": matched_item_ids,
-            "relaxed_item_ids": relaxed_item_ids,
-            "coverage_ok": len(checked_item_ids) == len(RUBRIC_ITEMS),
-        },
         "coaching_queue_order": coaching_queue_order,
-        "current_focus_id": coaching_queue_order[0] if coaching_queue_order else None,
+        "current_focus_id": current_focus_id,
+        "pending_question": first_question,
+        "phase": "guiding",
         "stuck_counter": 0,
         "hint_level": 0,
+        "rubric_eval_summary": {
+            "checked_item_ids": checked_item_ids,
+            "matched_item_ids": [i["rubric_item_id"] for i in normalized],
+            "relaxed_item_ids": relaxed_ids,
+            "coverage_ok": len(checked_item_ids) == len(RUBRIC_ITEMS),
+        },
     }
 
 
+def _llm_review(
+    scoring_criteria: str, teaching_material: str,
+    row_data: dict[str, Any], columns: list[str],
+) -> tuple[list[dict[str, Any]], list[int]]:
+    """LLM 评审：逐条对照 14 项评分标准"""
+    system = _build_system_prompt(scoring_criteria, teaching_material)
+
+    row_text = "\n".join(f"  {k}: {_format_value_for_view(v)}" for k, v in row_data.items() if v)
+    rubric_text = "\n".join(f"{item['id']}. [{item['category']}] {item['desc']} (等级{item['level']})" for item in RUBRIC_ITEMS)
+
+    prompt = f"""请严格逐条对照以下14项评分标准，评审这条岗标条目。
+
+### 被评审内容
+{row_text}
+
+### 评审标准
+{rubric_text}
+
+### 评审要求
+1. **必须逐条检查14项**，不要遗漏
+2. 使用三问法筛选：三问都过则不扣分
+3. 灰色地带默认放过——标准没明文覆盖的不主动找事
+4. 每条命中的问题项需要给出扣分等级（A=10分, B=5分）
+5. 岗位价值问题优先级最高
+
+### 真实反例（三问法通过，不应扣分）
+{REAL_EXAMPLE}
+
+仅输出 JSON：
+{{
+  "checked_item_ids": [1,2,3,...],
+  "issues": [
+    {{
+      "issue_id": "1",
+      "issue_desc": "问题描述",
+      "category": "岗位价值",
+      "level": "A",
+      "deduction": 10,
+      "explanation": "判定理由",
+      "user_facing_desc": "用户可见的自然语言描述"
+    }}
+  ]
+}}"""
+
+    try:
+        llm = _get_llm()
+        if llm is None:
+            raise Exception("LLM not available")
+        resp = llm.invoke([
+            SystemMessage(content=system),
+            HumanMessage(content=prompt),
+        ])
+        parsed = _safe_json_load(resp.content, {"checked_item_ids": [], "issues": []})
+        checked = parsed.get("checked_item_ids", list(range(1, 15)))
+        issues = parsed.get("issues", [])
+        return issues, checked
+    except Exception as e:
+        print(f"[LLM 评审失败] {e}")
+        return _rule_based_review(row_data)
+
+
+def _rule_based_review(row_data: dict[str, Any]) -> tuple[list[dict[str, Any]], list[int]]:
+    """无 LLM 时的规则评审"""
+    issues: list[dict[str, Any]] = []
+    checked: list[int] = list(range(1, 15))
+
+    value_text = _extract_value_text(row_data)
+
+    # 检查岗位价值
+    if value_text:
+        if not _passes_three_questions(value_text):
+            if not any(k in value_text for k in WHO_HINTS):
+                issues.append({"issue_id": "1", "issue_desc": "站在自身视角而不是站在客户视角提炼岗位价值", "category": "岗位价值", "level": "A", "deduction": 10})
+            if not any(k in value_text for k in BENEFIT_HINTS):
+                issues.append({"issue_id": "2", "issue_desc": "岗位价值并非源于对客户最在意、最深层需求的提炼", "category": "岗位价值", "level": "A", "deduction": 10})
+            if not any(k in value_text for k in BIZ_HINTS):
+                issues.append({"issue_id": "4", "issue_desc": "岗位价值描述空泛，指导性不强", "category": "岗位价值", "level": "A", "deduction": 10})
+        else:
+            # 三问法通过，放过
+            pass
+
+    # 检查岗位效能
+    eff_text = str(row_data.get("岗位效能", "") or row_data.get("岗位效能_", ""))
+    if not eff_text or eff_text == "无":
+        issues.append({"issue_id": "5", "issue_desc": "岗位效能并不能直接、有效地衡量岗位价值", "category": "岗位效能", "level": "A", "deduction": 10})
+
+    # 检查任务命名
+    for key, val in row_data.items():
+        if "任务" in key and isinstance(val, str) and val:
+            # 检查是否像目的
+            purpose_words = ("降低", "提升", "减少", "增加", "优化")
+            if any(val.startswith(w) for w in purpose_words):
+                issues.append({"issue_id": "8", "issue_desc": "直接用目的命名任务", "category": "岗位任务", "level": "B", "deduction": 5})
+
+    # 检查成果
+    for key, val in row_data.items():
+        if "成果" in key and isinstance(val, str) and val:
+            delivery_words = ("文档", "报告", "方案", "课件")
+            if any(w in val for w in delivery_words) and not any(k in val for k in ("率", "%", "次")):
+                issues.append({"issue_id": "13", "issue_desc": "把交付物当做成果", "category": "任务目的与成果", "level": "A", "deduction": 10})
+
+    return issues, checked
+
+
 # ─────────────────────────────────────────────────────────────
-# NODE 4: guide_reflection
-# 根据评审结果，向用户提出引导性问题，启动反思对话
+# NODE 3: guide_reflection — 分步引导（核心环节）
+# 对应 skill 阶段 3：五条铁律 + 引导武器 + 十一问
 # ─────────────────────────────────────────────────────────────
+
 def guide_reflection(state: CoachState) -> dict:
     """
     发出引导性问题，引导用户自我反思当前条目。
-    构建一段展示当前条目概况 + 引导问题的消息。
+    使用引导武器表和自检十一问生成自然的问题。
+    遵循每轮对话结构：肯定 → 切入 → 一问 → 等待。
     """
     idx = state["current_item_index"]
     review_items = state.get("review_items", [])
@@ -1026,7 +970,6 @@ def guide_reflection(state: CoachState) -> dict:
 
     current_review = review_items[idx] if idx < len(review_items) else None
     row_data = rows[idx]
-    columns = state["submission_columns"]
     total = len(rows)
     question = state.get("pending_question", "")
     issue_idx = state.get("current_issue_index", 0)
@@ -1039,132 +982,34 @@ def guide_reflection(state: CoachState) -> dict:
     elif not issue_queue:
         content = (
             f"📋 第 {idx+1}/{total} 条\n\n"
-            "当前条目未命中问题项。若你愿意，我也可以继续主动帮你做优化提问。"
+            "当前条目没有发现明显问题——写得挺到位的！"
+            "若你愿意，我也可以继续主动帮你做优化提问。"
         )
     else:
         issue = issue_queue[min(issue_idx, len(issue_queue) - 1)]
         content = _build_proactive_message(
-            idx=idx,
-            total=total,
-            row_data=row_data,
-            issue=issue,
-            question=question,
+            idx=idx, total=total, row_data=row_data,
+            issue=issue, question=question,
         )
 
-    msg = AIMessage(content=content)
     return {
-        "messages": [msg],
+        "messages": [AIMessage(content=content)],
         "awaiting_user_input": True,
         "phase": "guiding",
         "active_mode": "proactive",
     }
 
 
-def answer_user_question(state: CoachState) -> dict:
-    """场景二：用户主动提问时的被动答疑。"""
-    messages = state.get("messages", [])
-    user_messages = [m for m in messages if isinstance(m, HumanMessage)]
-    question = user_messages[-1].content if user_messages else ""
-
-    system = _build_system_prompt(
-        state.get("scoring_criteria", MOCK_SCORING_CRITERIA),
-        state.get("teaching_material", MOCK_TEACHING_MATERIAL),
-    )
-    qa_prompt = f"""用户主动提问如下，请进入被动答疑模式给出专业回答。
-
-用户问题：{question}
-
-要求：
-1. 直接回答问题，语言专业但简洁
-2. 可基于教材原则解释，但不要贴教材原文大段引用
-3. 如果当前仍在主动引导流程（phase=guiding/reviewing），回答后加一句"我们回到当前问题项"的过渡
-
-只输出 JSON：
-{{
-  "answer": "...",
-  "follow_back": "..."
-}}"""
-
-    if _is_llm_enabled():
-        try:
-            llm = _get_llm()
-            if llm is None:
-                raise Exception("LLM not available")
-            resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=qa_prompt)])
-            parsed = _safe_json_load(
-                resp.content,
-                {
-                    "answer": "这个问题很关键。建议你先从服务对象、可衡量成果和业务结果三个维度拆开检查。",
-                    "follow_back": "我们回到当前问题项，继续逐项完善。",
-                },
-            )
-        except Exception:
-            parsed = {
-                "answer": "这是一个很好的问题。可以先从服务对象、关键行为和可衡量成果三层去梳理。",
-                "follow_back": "我们回到当前问题项，继续逐项完善。",
-            }
-    else:
-        parsed = {
-            "answer": "这是一个很好的问题。可以先从服务对象、关键行为和可衡量成果三层去梳理。",
-            "follow_back": "我们回到当前问题项，继续逐项完善。",
-        }
-
-    follow_back = ""
-    if state.get("phase") in {"guiding", "reviewing"}:
-        follow_back = parsed.get("follow_back", "我们回到当前问题项，继续逐项完善。")
-    elif state.get("phase") == "done":
-        follow_back = "你还可以继续提问，我会持续答疑。"
-
-    content = f"💡 针对你的问题“{question}”：\n{parsed.get('answer', '')}"
-    if follow_back:
-        content += f"\n\n{follow_back}"
-
-    return {
-        "messages": [AIMessage(content=content)],
-        "active_mode": "reactive_qa",
-        "last_user_intent": "question",
-        "awaiting_user_input": True,
-    }
-
-
-def detect_user_intent(state: CoachState) -> dict:
-    """意图识别节点：规则优先，低置信度再走 LLM 二判。"""
-    phase = state.get("phase", "guiding")
-    messages = state.get("messages", [])
-    user_messages = [m for m in messages if isinstance(m, HumanMessage)]
-    last_user_msg = user_messages[-1].content if user_messages else ""
-
-    if phase == "done":
-        return {
-            "last_user_intent": "question",
-            "active_mode": "reactive_qa",
-        }
-
-    intent, confidence = _rule_based_intent(last_user_msg)
-    if intent == "uncertain" or confidence < 0.7:
-        intent = _llm_intent_fallback(state, last_user_msg)
-
-    return {
-        "last_user_intent": intent,
-        "active_mode": "reactive_qa" if intent == "question" else "proactive",
-    }
-
-
 # ─────────────────────────────────────────────────────────────
-# NODE 5: process_response
-# 处理用户回复，决定继续追问 or 进入下一条目
-# 遵循用户修改后的回判三步：1.肯定进步 2.给出判断 3.追或不追
+# NODE 3b: process_response — 处理用户回复
+# 回判三步：1.肯定进步 2.给出判断 3.追或不追
 # ─────────────────────────────────────────────────────────────
+
 def process_response(state: CoachState) -> dict:
     """
-    分析用户对引导问题的回复：
-    - 理解不深：继续追问（最多3轮）
-    - 理解到位 or 已达最大轮次：给予总结性反馈，移向下一条目
-
-    回判三步：
-    1. 肯定进步 - 必须指出当前版比上版好在哪个具体点
-    2. 给出判断 - 用自然的话告诉用户这一项过了没
-    3. 追或不追 - 跨过三问法合格线则放过，未跨过则再问
+    分析用户对引导问题的回复。
+    回判三步：肯定进步 → 给出判断 → 追或不追。
+    "还能更好"不是追问的理由，"评委会扣分"才是。
     """
     idx = state["current_item_index"]
     review_items = state.get("review_items", [])
@@ -1177,7 +1022,6 @@ def process_response(state: CoachState) -> dict:
     max_round = 3
     print(f"[Node] process_response: 条目{idx+1}，问题项{issue_idx+1}，已追问{issue_round+1}轮")
 
-    # 获取用户最后一条消息
     user_messages = [m for m in messages if isinstance(m, HumanMessage)]
     last_user_msg = user_messages[-1].content if user_messages else ""
 
@@ -1193,14 +1037,8 @@ def process_response(state: CoachState) -> dict:
 
     current_issue = issue_queue[min(issue_idx, len(issue_queue) - 1)]
     rubric_item_id = int(current_issue.get("rubric_item_id", 0) or 0)
-    category = current_issue.get("category", "")
 
-    system = _build_system_prompt(
-        state["scoring_criteria"],
-        state["teaching_material"]
-    )
-
-    # 构建上下文：最近几轮对话
+    system = _build_system_prompt(state["scoring_criteria"], state["teaching_material"])
     recent = messages[-8:] if len(messages) > 8 else messages
 
     decide_prompt = f"""当前正在辅导第{idx+1}条岗标条目的当前问题项。
@@ -1246,29 +1084,26 @@ def process_response(state: CoachState) -> dict:
                 *recent,
                 HumanMessage(content=decide_prompt),
             ])
-            decision = _safe_json_load(
-                response.content,
-                {
-                    "affirmation": "你这轮思考有进展。",
-                    "issue_resolved": False,
-                    "judgment": "方向对了，但还可以更具体。",
-                    "feedback_to_user": "你的方向是对的，我们再把关键点说得更具体一些。",
-                    "next_question": "如果你现在就改写这段内容，你会先增加哪一个可量化或可验证的信息？",
-                },
-            )
+            decision = _safe_json_load(response.content, {
+                "affirmation": "你这轮思考有进展。",
+                "issue_resolved": False,
+                "judgment": "方向对了，但还可以更具体。",
+                "feedback_to_user": "你的方向是对的，我们再把关键点说得更具体一些。",
+                "next_question": "如果你现在就改写这段内容，你会先增加哪一个可量化或可验证的信息？",
+            })
         except Exception:
             decision = _fallback_decision(last_user_msg, rubric_item_id)
     else:
         decision = _fallback_decision(last_user_msg, rubric_item_id)
 
-    # 提取判断结果
     affirmation = decision.get("affirmation", "你这轮思考有进展。")
     feedback = decision.get("feedback_to_user", "谢谢你的思考。")
     issue_resolved = bool(decision.get("issue_resolved", False))
     next_question = decision.get("next_question", "你觉得还差哪一步可以让这个问题真正解决？")
 
-    # 三问法检查（仅对岗位价值类问题）
-    if not issue_resolved and rubric_item_id in {1, 2, 3, 4}:
+    # 三问法检查（仅对视角偏差类问题：1=视角偏差, 3=多客户视角）
+    # 其他岗位价值问题(2=深度偏差, 4=空泛)不适用三问法，由 LLM/规则判断
+    if not issue_resolved and rubric_item_id in {1, 3}:
         issue_resolved = _passes_three_questions(last_user_msg)
         if issue_resolved:
             feedback = f"{affirmation} 你已经补齐了服务对象、具体收益和业务落点，这一项可以先放过。"
@@ -1281,10 +1116,12 @@ def process_response(state: CoachState) -> dict:
     queue_copy = list(issue_queue)
 
     if issue_resolved:
-        # 问题解决，进入下一个
         current_issue_id = current_issue.get("issue_id", f"issue_{issue_idx}")
         issue_status_map[current_issue_id] = "resolved"
         queue_copy[issue_idx]["status"] = "resolved"
+
+        # 更新进度
+        _call_progress_script("update", current_issue_id, "pass", "三问法通过或用户给出可执行改进")
 
         next_issue_idx = issue_idx + 1
         if next_issue_idx < len(queue_copy):
@@ -1328,10 +1165,51 @@ def process_response(state: CoachState) -> dict:
     hint_level = state.get("hint_level", 0)
     next_issue_round = issue_round + 1
 
-    # 卡住超3轮，升级提示
     if next_issue_round >= max_round:
         stuck_counter += 1
         hint_level = min(hint_level + 1, 3)
+
+        # 如果卡住超过3次（9轮追问），自动放过当前问题项
+        if stuck_counter >= 3:
+            current_issue_id = current_issue.get("issue_id", f"issue_{issue_idx}")
+            issue_status_map[current_issue_id] = "resolved"
+            queue_copy[issue_idx]["status"] = "resolved"
+            review_items[idx]["issue_queue"] = queue_copy
+
+            next_issue_idx = issue_idx + 1
+            if next_issue_idx < len(queue_copy):
+                queue_copy[next_issue_idx]["status"] = "in_progress"
+                next_issue = queue_copy[next_issue_idx]
+                issue_status_map[next_issue.get("issue_id", f"issue_{next_issue_idx}")] = "in_progress"
+                next_question_new = _generate_issue_question(
+                    state["scoring_criteria"],
+                    state["teaching_material"],
+                    rows[idx],
+                    next_issue,
+                )
+                return {
+                    "messages": [AIMessage(content="我们先放过这个点，后面有时间可以再回来打磨。我们进入下一个关注点。")],
+                    "review_items": review_items,
+                    "issue_status_map": issue_status_map,
+                    "current_issue_index": next_issue_idx,
+                    "issue_round": 0,
+                    "pending_question": next_question_new,
+                    "phase": "guiding",
+                    "active_mode": "proactive",
+                    "last_user_intent": "reply",
+                    "awaiting_user_input": False,
+                    "current_focus_id": next_issue.get("issue_id"),
+                    "stuck_counter": 0,
+                    "hint_level": 0,
+                }
+            else:
+                return {
+                    **_advance_to_next_item(state, "我们先放过这个点，后面有时间可以再回来打磨。"),
+                    "review_items": review_items,
+                    "issue_status_map": issue_status_map,
+                    "last_user_intent": "reply",
+                }
+
         next_question = _build_escalation_question(current_issue, rows[idx], hint_level)
         next_issue_round = 0
 
@@ -1353,12 +1231,12 @@ def process_response(state: CoachState) -> dict:
 
 
 def _fallback_decision(user_msg: str, rubric_item_id: int) -> dict:
-    """无LLM时的兜底判断逻辑"""
-    has_action = any(k in user_msg for k in ["我会", "我改", "我补充", "改成", "增加"])
-    has_metric = any(k in user_msg for k in ["可量化", "指标", "%", "率", "次", "个"])
-    has_customer = any(k in user_msg for k in WHO_HINTS)
-
-    # 三问法检查
+    """无 LLM 时的兜底判断逻辑"""
+    has_action = any(k in user_msg for k in ["我会", "我改", "我补充", "改成", "增加", "I'll", "I should", "rename", "restructure"])
+    has_metric = any(k in user_msg for k in ["可量化", "指标", "%", "率", "次", "个", "rate", "<=", ">="])
+    has_customer = any(k in user_msg for k in WHO_HINTS) or any(
+        k in user_msg.lower() for k in ("product manager", "business", "customer", "user", "team")
+    )
     passes_three = _passes_three_questions(user_msg)
 
     if rubric_item_id in {1, 2, 3, 4}:
@@ -1371,16 +1249,25 @@ def _fallback_decision(user_msg: str, rubric_item_id: int) -> dict:
                 "feedback_to_user": "你已经明确了客户、好处和商业落点，这一项可以过了。",
                 "next_question": "",
             }
-        elif has_customer and has_action:
+        if has_customer and has_action:
             return {
                 "affirmation": "你开始从客户视角思考了，",
-                "issue_resolved": False,
+                "issue_resolved": passes_three,
                 "judgment": "还需要再具体一点。",
                 "feedback_to_user": "方向对了，能不能再说说客户能获得什么具体好处？",
                 "next_question": "如果只改一处，你会先补充哪条最具体的信息？",
             }
-    elif rubric_item_id == 5:
-        # 岗位效能问题
+        # 对于深度偏差(2)和空泛(4)：只要用户给出有客户+动作的改进，就通过
+        if rubric_item_id in {2, 4} and (has_customer or has_action):
+            return {
+                "affirmation": "你在往更具体的方向走了，",
+                "issue_resolved": True,
+                "judgment": "方向对了，可以放过。",
+                "feedback_to_user": "这个改进比之前具体多了，这一项可以过了。",
+                "next_question": "",
+            }
+
+    if rubric_item_id == 5:
         if has_metric:
             return {
                 "affirmation": "你找到了衡量方式，",
@@ -1389,14 +1276,54 @@ def _fallback_decision(user_msg: str, rubric_item_id: int) -> dict:
                 "feedback_to_user": "这个指标很具体，可以过了。",
                 "next_question": "",
             }
-    elif rubric_item_id in {7, 8}:
-        # 任务命名问题
-        if "动词" in user_msg or "名词" in user_msg or any(k in user_msg for k in ["负责", "完成", "制定", "整理"]):
+
+    if rubric_item_id in {6}:
+        if has_action:
+            return {
+                "affirmation": "你在重新梳理任务和价值的关系，",
+                "issue_resolved": True,
+                "judgment": "任务-价值对应更清晰了。",
+                "feedback_to_user": "这样关联起来更清楚了，可以过了。",
+                "next_question": "",
+            }
+
+    if rubric_item_id in {7, 8}:
+        if "动词" in user_msg or any(k in user_msg for k in ["负责", "完成", "制定", "整理", "rename", "verb"]):
             return {
                 "affirmation": "你开始调整任务命名了，",
                 "issue_resolved": True,
                 "judgment": "符合动宾结构即可。",
                 "feedback_to_user": "这个命名更清晰了，可以过了。",
+                "next_question": "",
+            }
+
+    if rubric_item_id in {9}:
+        if has_action:
+            return {
+                "affirmation": "你开始明确目的了，",
+                "issue_resolved": True,
+                "judgment": "目的更清晰了。",
+                "feedback_to_user": "这个目的比之前明确多了，可以过了。",
+                "next_question": "",
+            }
+
+    if rubric_item_id in {10}:
+        if has_metric:
+            return {
+                "affirmation": "你在把成果和目的关联起来，",
+                "issue_resolved": True,
+                "judgment": "成果标准已明确。",
+                "feedback_to_user": "成果和目的能对上了，可以过了。",
+                "next_question": "",
+            }
+
+    if rubric_item_id in {12, 13, 14}:
+        if has_metric or has_action:
+            return {
+                "affirmation": "你在把成果写得更具体了，",
+                "issue_resolved": True,
+                "judgment": "成果标准更可衡量了。",
+                "feedback_to_user": "这样写成果更可验证了，可以过了。",
                 "next_question": "",
             }
 
@@ -1410,11 +1337,252 @@ def _fallback_decision(user_msg: str, rubric_item_id: int) -> dict:
     }
 
 
+
 # ─────────────────────────────────────────────────────────────
-# 辅助：创建 Mock 提交文件（测试用）
+# NODE 3c: detect_user_intent — 意图识别
 # ─────────────────────────────────────────────────────────────
+
+def detect_user_intent(state: CoachState) -> dict:
+    """意图识别：规则优先，低置信度再走 LLM 二判。"""
+    phase = state.get("phase", "guiding")
+    messages = state.get("messages", [])
+    user_messages = [m for m in messages if isinstance(m, HumanMessage)]
+    last_user_msg = user_messages[-1].content if user_messages else ""
+
+    if phase in {"done", "closure"}:
+        return {"last_user_intent": "question", "active_mode": "reactive_qa"}
+
+    intent, confidence = _rule_based_intent(last_user_msg)
+    if intent == "uncertain" or confidence < 0.7:
+        intent = _llm_intent_fallback(state, last_user_msg)
+
+    return {
+        "last_user_intent": intent,
+        "active_mode": "reactive_qa" if intent == "question" else "proactive",
+    }
+
+
+def _llm_intent_fallback(state: CoachState, user_text: str) -> str:
+    """二判：当规则不稳定时，用轻量 LLM 分类"""
+    system = _build_system_prompt(
+        state.get("scoring_criteria", MOCK_SCORING_CRITERIA),
+        state.get("teaching_material", MOCK_TEACHING_MATERIAL),
+    )
+    prompt = f"""请判断用户最新输入意图。
+
+当前阶段: {state.get('phase', 'guiding')}
+当前待引导问题: {state.get('pending_question', '')}
+用户输入: {user_text}
+
+分类标准:
+1. intent=reply: 用户在回答当前引导问题或给出修改思路
+2. intent=question: 用户在主动发起新的咨询问题（解释/方法/示例等）
+
+仅输出 JSON:
+{{"intent":"reply或question","confidence":0.0}}"""
+
+    if not _is_llm_enabled():
+        return "reply"
+    try:
+        llm = _get_llm()
+        if llm is None:
+            return "reply"
+        resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=prompt)])
+    except Exception:
+        return "reply"
+
+    parsed = _safe_json_load(resp.content, {"intent": "reply", "confidence": 0.5})
+    intent = str(parsed.get("intent", "reply")).strip().lower()
+    return intent if intent in {"reply", "question"} else "reply"
+
+
+# ─────────────────────────────────────────────────────────────
+# NODE 3d: answer_user_question — 被动答疑
+# ─────────────────────────────────────────────────────────────
+
+def answer_user_question(state: CoachState) -> dict:
+    """场景二：用户主动提问时的被动答疑。"""
+    messages = state.get("messages", [])
+    user_messages = [m for m in messages if isinstance(m, HumanMessage)]
+    question = user_messages[-1].content if user_messages else ""
+
+    system = _build_system_prompt(
+        state.get("scoring_criteria", MOCK_SCORING_CRITERIA),
+        state.get("teaching_material", MOCK_TEACHING_MATERIAL),
+    )
+    qa_prompt = f"""用户主动提问如下，请进入被动答疑模式给出专业回答。
+
+用户问题：{question}
+
+要求：
+1. 直接回答问题，语言专业但简洁
+2. 可基于教材原则解释，但不要贴教材原文大段引用
+3. 如果当前仍在主动引导流程（phase=guiding/reviewing），回答后加一句"我们回到当前问题项"的过渡
+4. 用人话说，不报章节号、不报条目编号
+
+只输出 JSON：
+{{
+  "answer": "...",
+  "follow_back": "..."
+}}"""
+
+    if _is_llm_enabled():
+        try:
+            llm = _get_llm()
+            if llm is None:
+                raise Exception("LLM not available")
+            resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=qa_prompt)])
+            parsed = _safe_json_load(resp.content, {
+                "answer": "这个问题很关键。建议你先从服务对象、可衡量成果和业务结果三个维度拆开检查。",
+                "follow_back": "我们回到当前问题项，继续逐项完善。",
+            })
+        except Exception:
+            parsed = {
+                "answer": "这是一个很好的问题。可以先从服务对象、关键行为和可衡量成果三层去梳理。",
+                "follow_back": "我们回到当前问题项，继续逐项完善。",
+            }
+    else:
+        parsed = {
+            "answer": "这是一个很好的问题。可以先从服务对象、关键行为和可衡量成果三层去梳理。",
+            "follow_back": "我们回到当前问题项，继续逐项完善。",
+        }
+
+    follow_back = ""
+    if state.get("phase") in {"guiding", "reviewing"}:
+        follow_back = parsed.get("follow_back", "我们回到当前问题项，继续逐项完善。")
+    elif state.get("phase") in {"done", "closure"}:
+        follow_back = "你还可以继续提问，我会持续答疑。"
+
+    answer_text = parsed.get("answer", "")
+    content = f"\U0001f4ab 针对你的问题<<{question}>>：\n{answer_text}"
+    if follow_back:
+        content += f"\n\n{follow_back}"
+
+    return {
+        "messages": [AIMessage(content=content)],
+        "active_mode": "reactive_qa",
+        "last_user_intent": "question",
+        "awaiting_user_input": True,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# NODE 4: generate_closure — 收尾总结
+# 对应 skill 阶段 4：自然总结 + 不给打分 + 教材收束
+# ─────────────────────────────────────────────────────────────
+
+def generate_closure(state: CoachState) -> dict:
+    """
+    收尾总结：
+    - 哪些地方改得特别好
+    - 还有哪些可以继续打磨
+    - 用一句教材里的话作为收束（用人话说，不标出处）
+    - 不给具体打分
+    - 清理进度
+    """
+    review_items = state.get("review_items", [])
+    rows = state["submission_rows"]
+
+    highlights: list[str] = []
+    remaining: list[str] = []
+
+    for idx, review in enumerate(review_items):
+        issue_queue = review.get("issue_queue", [])
+        resolved = [q for q in issue_queue if q.get("status") == "resolved"]
+        pending = [q for q in issue_queue if q.get("status") != "resolved"]
+
+        if resolved:
+            for q in resolved:
+                highlights.append(f"第{idx+1}条的{q.get('category', '')}部分改得很到位")
+        if pending:
+            for q in pending:
+                remaining.append(f"第{idx+1}条的{q.get('category', '')}还可以继续打磨")
+
+    # 生成总结文本
+    if _is_llm_enabled():
+        closure_text = _llm_closure(state, highlights, remaining)
+    else:
+        closure_text = _rule_based_closure(highlights, remaining)
+
+    # 清理进度
+    _call_progress_script("reset")
+
+    return {
+        "phase": "closure",
+        "closure_summary": closure_text,
+        "highlights": highlights,
+        "remaining_polish": remaining,
+        "messages": [AIMessage(content=closure_text)],
+        "awaiting_user_input": True,
+        "active_mode": "reactive_qa",
+    }
+
+
+def _llm_closure(state: CoachState, highlights: list[str], remaining: list[str]) -> str:
+    """LLM 生成收尾总结"""
+    system = _build_system_prompt(state["scoring_criteria"], state["teaching_material"])
+
+    h_text = "\n".join(f"- {h}" for h in highlights) if highlights else "（无特别突出的修改）"
+    r_text = "\n".join(f"- {r}" for r in remaining) if remaining else "（没有需要继续打磨的地方了）"
+
+    prompt = f"""辅导已全部完成，请生成收尾总结。
+
+改得好的地方：
+{h_text}
+
+可以继续打磨的地方：
+{r_text}
+
+要求：
+1. 用自然的语气总结，像老同事在茶水间聊完天的那种感觉
+2. 不给具体打分——评分是评委的事
+3. 用一句教材里的话作为收束，但要用人话说出来，不要标出处
+4. 不要太长，3-5 句话就好
+
+直接输出总结文本，不要 JSON 格式。"""
+
+    try:
+        llm = _get_llm()
+        if llm is None:
+            raise Exception("LLM not available")
+        resp = llm.invoke([
+            SystemMessage(content=system),
+            HumanMessage(content=prompt),
+        ])
+        return resp.content.strip()
+    except Exception:
+        return _rule_based_closure(highlights, remaining)
+
+
+def _rule_based_closure(highlights: list[str], remaining: list[str]) -> str:
+    """规则兜底收尾总结"""
+    parts = []
+
+    if highlights:
+        parts.append("改得好的地方：")
+        for h in highlights[:5]:
+            parts.append(f"  - {h}")
+
+    if remaining:
+        parts.append("\n可以继续打磨的地方：")
+        for r in remaining[:5]:
+            parts.append(f"  - {r}")
+
+    # 用人话引用教材核心观点
+    parts.append(
+        "\n记住，你的价值由你服务的客户定义——"
+        "始于客户需求，终于客户需求。继续加油！"
+    )
+
+    return "\n".join(parts)
+
+
+# ─────────────────────────────────────────────────────────────
+# 辅助：创建 Mock 提交文件
+# ─────────────────────────────────────────────────────────────
+
 def _create_mock_submission() -> str:
-    """创建一个测试用的岗标提交文件（含多级表头和左右分表结构）"""
+    """创建测试用的岗标提交文件"""
     import openpyxl
     path = "/tmp/mock_submission.xlsx"
     wb = openpyxl.Workbook()
@@ -1424,31 +1592,31 @@ def _create_mock_submission() -> str:
     # Row 1: 大类表头
     ws.append(["岗位价值", "岗位效能", "核心任务", None, None, "资源投入",
                "辅助任务", None, None, "资源投入"])
-    ws.merge_cells("C1:E1")   # 核心任务 横跨3列
-    ws.merge_cells("G1:I1")   # 辅助任务 横跨3列
+    ws.merge_cells("C1:E1")
+    ws.merge_cells("G1:I1")
 
     # Row 2: 子列表头
     ws.append([None, None, "任务名称", "任务目的", "成果标准", None,
                "任务名称", "任务目的", "成果标准", None])
-    ws.merge_cells("A1:A2")   # 岗位价值 纵向合并
-    ws.merge_cells("B1:B2")   # 岗位效能 纵向合并
-    ws.merge_cells("F1:F2")   # 资源投入 纵向合并
-    ws.merge_cells("J1:J2")   # 资源投入 纵向合并
+    ws.merge_cells("A1:A2")
+    ws.merge_cells("B1:B2")
+    ws.merge_cells("F1:F2")
+    ws.merge_cells("J1:J2")
 
-    # ── 条目1：有问题的内容 ──
+    # 条目1：有问题的内容
     ws.append([
-        "负责软件开发工作", "无",           # 价值描述太宽泛，效能无指标
-        "写代码", "完成功能开发", "完成任务", "60%",    # 核心任务1
-        "开会", "信息同步", "参加会议", "40%",          # 辅助任务1
+        "负责软件开发工作", "无",
+        "写代码", "完成功能开发", "完成任务", "60%",
+        "开会", "信息同步", "参加会议", "40%",
     ])
     ws.append([
         None, None,
-        "修bug", "减少缺陷", "bug数量", None,           # 核心任务2
-        "写周报", "汇报工作", "提交周报", None,          # 辅助任务2
+        "修bug", "减少缺陷", "bug数量", None,
+        "写周报", "汇报工作", "提交周报", None,
     ])
     ws.merge_cells("A3:A4")
 
-    # ── 条目2：较好的内容 ──
+    # 条目2：较好的内容
     ws.append([
         "通过技术架构优化提升系统稳定性", "系统可用率≥99.9%",
         "主导核心模块技术方案设计", "提升模块质量与可维护性", "方案评审通过率100%", "70%",
@@ -1461,7 +1629,7 @@ def _create_mock_submission() -> str:
     ])
     ws.merge_cells("A5:A6")
 
-    # ── 条目3：有问题的内容 ──
+    # 条目3
     ws.append([
         "支撑业务快速迭代", "无",
         "需求分析和功能开发", "满足业务需求", "功能上线", "80%",

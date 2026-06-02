@@ -1,36 +1,53 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# 岗标辅导系统 — 前端
 
-## Getting Started
+Next.js 前端，对接后端 FastAPI + LangGraph 辅导引擎。
 
-First, run the development server:
+## 功能
+
+- 上传"岗位价值与岗位任务"Excel 文件
+- 实时对话式辅导（SSE 流式输出）
+- 显示辅导进度（当前条目、问题项、阶段）
+- 支持主动引导 + 被动答疑两种模式
+
+## API 对接
+
+| 端点 | 用途 |
+|------|------|
+| `POST /api/session/start/stream` | 创建会话，SSE 流式返回初始化消息 |
+| `POST /api/upload` | 上传 xlsx 文件 |
+| `POST /api/chat/stream` | 发送消息，SSE 流式返回 AI 回复 |
+| `GET /api/session/{id}/state` | 获取会话状态（phase / current_item / focus_id / stuck_counter） |
+
+## 开发
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000) with your browser.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Docker 部署
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+docker compose up -d --build
+# 访问 http://127.0.0.1:8080
+```
 
-## Learn More
+> 注意：Docker 环境通过 nginx 反向代理，前端和后端 API 统一在 `127.0.0.1:8080` 访问。
+> 前端代码中 `API_BASE` 为空字符串，API 请求自动走同域 nginx 代理到后端。
 
-To learn more about Next.js, take a look at the following resources:
+## 状态字段
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+前端通过 `/api/session/{id}/state` 获取的会话状态：
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `phase` | string | `loaded` / `reviewing` / `guiding` / `done` / `closure` |
+| `current_item_index` | int | 当前辅导的条目索引（从 0 开始） |
+| `total_items` | int | 总条目数 |
+| `active_mode` | string | `proactive`（主动引导）/ `reactive_qa`（被动答疑） |
+| `current_focus_id` | string? | 当前聚焦的问题项 ID |
+| `stuck_counter` | int | 用户卡住次数 |
+| `hint_level` | int | 提示升级级别（0-3） |
+| `closure_summary` | string? | 收尾总结文本 |

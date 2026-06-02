@@ -3,3 +3,6 @@ __pycache__
 .git
 web/node_modules
 web/.next
+data/
+*.md
+!backend/references/*.md

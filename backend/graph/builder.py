@@ -1,38 +1,37 @@
 """
 岗标辅导 Graph 组装
 
-Graph 结构：
+完全实现 gangbiao-coach skill v2 的阶段 0-4 生命周期：
 
-  START
-    │
-    ▼
-  load_standards ──────────────────────────────┐
-    │ (phase="loaded")                          │
-    ▼                                           │
-  [等待用户上传文件]                             │
-    │ (用户消息中包含文件路径)                   │
-    ▼                                           │
-  parse_submission                              │
-    │ (phase="reviewing")                       │
-    ▼                                           │
-  review_item ←────────────────────────────────┤
-    │ (phase="guiding")                         │
-    ▼                                           │
-  guide_reflection                              │
-    │ (awaiting_user_input=True)                │
-    ▼                                           │
-  [等待用户回复]                                │
-    │ (用户消息)                                │
-    ▼                                           │
-  process_response                              │
-    │                                           │
-    ├── next_action="continue_reflection" ──→ guide_reflection
-    │
-    └── next_action="next_item"
-          │
-          ├── 还有条目 ──→ review_item
-          │
-          └── 全部完成 ──→ END
+  阶段 0 (文件采集)                           阶段 4 (收尾)
+  ───────────────                             ──────────────
+  START → load_standards                      generate_closure
+    │ (检查进度)                                  │
+    ▼                                              ▼
+  [等待用户上传文件]                           [等待用户提问或结束]
+    │ (用户提供文件)                              │
+    ▼                                              │
+  阶段 1 (结构校验)                              │
+  validate_structure                             │
+    │ (校验通过)                                  │
+    ▼                                              │
+  阶段 2 (全面评审)                              │
+  review_item ←─────────────────────────────┐    │
+    │ (phase="guiding")                      │    │
+    ▼                                        │    │
+  阶段 3 (分步引导)                           │    │
+  guide_reflection                           │    │
+    │ (awaiting_user_input=True)             │    │
+    ▼                                        │    │
+  [等待用户回复]                              │    │
+    │ (用户消息)                              │    │
+    ▼                                        │    │
+  detect_user_intent                         │    │
+    ├─ intent=question → answer_user_question ┘   │
+    └─ intent=reply → process_response            │
+         ├─ next_action="continue" → guide_reflection
+         ├─ next_action="next_item" → review_item
+         └─ next_action="done"     → generate_closure → END
 """
 from __future__ import annotations
 from typing import Literal
@@ -43,12 +42,13 @@ from langgraph.checkpoint.memory import MemorySaver
 from .state import CoachState
 from .nodes import (
     load_standards,
-    parse_submission,
+    validate_structure,
     review_item,
     guide_reflection,
     process_response,
     answer_user_question,
     detect_user_intent,
+    generate_closure,
 )
 
 
@@ -61,29 +61,27 @@ def route_after_load(state: CoachState) -> Literal["wait_for_file"]:
     return "wait_for_file"
 
 
-def route_after_human(state: CoachState) -> Literal[
-    "parse_submission", "process_response", "guide_reflection"
-]:
+def route_after_validate(state: CoachState) -> Literal["wait_for_file", "review_item"]:
     """
-    收到用户消息后的路由：
-    - 如果是初始阶段（loaded），检测到文件路径 → parse_submission
-    - 如果是 guiding 阶段 → process_response
-    - 其他 → guide_reflection（兜底）
+    validate_structure 之后：
+    - 校验失败 → 回到等待文件
+    - 校验通过 → 进入评审
     """
-    phase = state.get("phase", "init")
-    submission_path = state.get("submission_path")
-    messages = state.get("messages", [])
+    if not state.get("structure_valid", True):
+        return "wait_for_file"
+    return "review_item"
 
-    if phase == "loaded" and submission_path:
-        return "parse_submission"
-    elif phase == "guiding":
-        return "process_response"
-    else:
-        return "guide_reflection"
+
+def route_after_review(state: CoachState) -> Literal["guide_reflection", "generate_closure", "wait_for_reply"]:
+    """review_item 之后路由"""
+    phase = state.get("phase", "guiding")
+    if phase == "done":
+        return "generate_closure"
+    return "guide_reflection"
 
 
 def route_after_intent(state: CoachState) -> Literal["process_response", "answer_user_question"]:
-    """基于 detect_user_intent 节点结果进行路由。"""
+    """基于 detect_user_intent 节点结果进行路由"""
     intent = state.get("last_user_intent", "reply")
     if intent == "question":
         return "answer_user_question"
@@ -91,29 +89,29 @@ def route_after_intent(state: CoachState) -> Literal["process_response", "answer
 
 
 def route_after_process_response(state: CoachState) -> Literal[
-    "review_item", "guide_reflection", "wait_for_reply"
+    "review_item", "guide_reflection", "generate_closure", "wait_for_reply"
 ]:
     """
     process_response 之后的路由：
-    - phase="reviewing" → 有新条目待评审 → review_item
-    - phase="guiding"  → 继续当前条目引导 → guide_reflection
-    - phase="done"     → 进入答疑等待态
+    - phase="done"        → 收尾
+    - phase="reviewing"   → 有新条目待评审 → review_item
+    - phase="guiding"     → 继续当前条目引导 → guide_reflection
+    - phase="closure"     → 已在收尾流程
     """
     phase = state.get("phase", "guiding")
     if phase == "done":
-        return "wait_for_reply"
+        return "generate_closure"
     elif phase == "reviewing":
         return "review_item"
+    elif phase in {"closure"}:
+        return "wait_for_reply"
     else:
         return "guide_reflection"
 
 
-def route_after_review(state: CoachState) -> Literal["guide_reflection", "wait_for_reply"]:
-    """review_item 之后路由"""
-    phase = state.get("phase", "guiding")
-    if phase == "done":
-        return "wait_for_reply"
-    return "guide_reflection"
+def route_after_closure(state: CoachState) -> Literal["wait_for_reply", "END"]:
+    """收尾之后：等待用户继续提问或结束"""
+    return "wait_for_reply"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -122,7 +120,7 @@ def route_after_review(state: CoachState) -> Literal["guide_reflection", "wait_f
 
 def wait_for_file(state: CoachState) -> dict:
     """占位 Node，实际由 interrupt_before 暂停在此处等待用户上传文件"""
-    return {}  # 不修改状态；图会被 interrupt 暂停
+    return {}
 
 
 def wait_for_reply(state: CoachState) -> dict:
@@ -142,41 +140,58 @@ def build_graph() -> StateGraph:
     builder = StateGraph(CoachState)
 
     # ── 注册节点 ──────────────────────────────────────────────
+
+    # 阶段 0: 初始化 + 文件采集
     builder.add_node("load_standards", load_standards)
-    builder.add_node("wait_for_file", wait_for_file)        # 等待用户上传文件
-    builder.add_node("parse_submission", parse_submission)
+    builder.add_node("wait_for_file", wait_for_file)
+
+    # 阶段 1: 结构校验
+    builder.add_node("validate_structure", validate_structure)
+
+    # 阶段 2: 全面评审
     builder.add_node("review_item", review_item)
+
+    # 阶段 3: 分步引导
     builder.add_node("guide_reflection", guide_reflection)
-    builder.add_node("wait_for_reply", wait_for_reply)      # 等待用户回复
+    builder.add_node("wait_for_reply", wait_for_reply)
     builder.add_node("detect_user_intent", detect_user_intent)
     builder.add_node("process_response", process_response)
     builder.add_node("answer_user_question", answer_user_question)
 
+    # 阶段 4: 收尾
+    builder.add_node("generate_closure", generate_closure)
+
     # ── 连接边 ────────────────────────────────────────────────
 
-    # 启动 → 加载标准
+    # 阶段 0: 启动 → 加载标准 → 等待文件
     builder.add_edge(START, "load_standards")
-
-    # 加载完成 → 等待文件
     builder.add_edge("load_standards", "wait_for_file")
 
-    # 等待文件 → 解析（用户提供文件后）
-    builder.add_edge("wait_for_file", "parse_submission")
+    # 等待文件 → 结构校验（用户提供文件后）
+    builder.add_edge("wait_for_file", "validate_structure")
 
-    # 解析完成 → 评审第一条
-    builder.add_edge("parse_submission", "review_item")
+    # 阶段 1: 结构校验后路由
+    builder.add_conditional_edges(
+        "validate_structure",
+        route_after_validate,
+        {
+            "wait_for_file": "wait_for_file",
+            "review_item": "review_item",
+        }
+    )
 
-    # 评审完成 → 引导反思
+    # 阶段 2: 评审后路由
     builder.add_conditional_edges(
         "review_item",
         route_after_review,
         {
             "guide_reflection": "guide_reflection",
+            "generate_closure": "generate_closure",
             "wait_for_reply": "wait_for_reply",
         }
     )
 
-    # 发出引导问题 → 等待用户回复
+    # 阶段 3: 引导 → 等待用户回复
     builder.add_edge("guide_reflection", "wait_for_reply")
 
     # 收到回复：先识别意图
@@ -202,9 +217,13 @@ def build_graph() -> StateGraph:
         {
             "review_item": "review_item",
             "guide_reflection": "guide_reflection",
+            "generate_closure": "generate_closure",
             "wait_for_reply": "wait_for_reply",
         }
     )
+
+    # 阶段 4: 收尾 → 等待用户继续提问或结束
+    builder.add_edge("generate_closure", "wait_for_reply")
 
     # ── 编译（interrupt_before 让 wait 节点暂停等待用户输入） ──
     memory = MemorySaver()
@@ -228,23 +247,11 @@ def send_user_message(
 ) -> list[str]:
     """
     向正在等待的 Graph 发送用户消息，恢复执行并收集 AI 回复。
-
-    Parameters
-    ----------
-    graph       : 已编译的 CompiledGraph
-    thread_id   : 会话 ID
-    user_input  : 用户文本输入
-    file_path   : 用户上传的文件路径（可选）
-
-    Returns
-    -------
-    list[str] : 本次执行产生的所有 AI 消息内容
     """
-    from langchain_core.messages import HumanMessage
+    from langchain_core.messages import HumanMessage, AIMessage
 
     config = {"configurable": {"thread_id": thread_id}}
 
-    # 构建状态更新
     update: dict = {
         "messages": [HumanMessage(content=user_input)],
         "awaiting_user_input": False,
@@ -252,11 +259,9 @@ def send_user_message(
     if file_path:
         update["submission_path"] = file_path
 
-    # 更新状态并恢复执行
     graph.update_state(config, update)
 
     # 预填充已有 AI 消息，避免重复返回历史消息
-    from langchain_core.messages import AIMessage
     pre_state = graph.get_state(config)
     seen: set[str] = set()
     for m in pre_state.values.get("messages", []):

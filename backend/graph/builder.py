@@ -72,12 +72,26 @@ def route_after_validate(state: CoachState) -> Literal["wait_for_file", "review_
     return "review_item"
 
 
-def route_after_review(state: CoachState) -> Literal["guide_reflection", "generate_closure", "wait_for_reply"]:
+def route_after_review(state: CoachState) -> Literal["guide_reflection", "generate_closure", "review_item"]:
     """review_item 之后路由"""
     phase = state.get("phase", "guiding")
     if phase == "done":
         return "generate_closure"
+    if phase == "reviewing":
+        # 当前条目无问题，自动推进到下一条
+        return "review_item"
     return "guide_reflection"
+
+
+def route_after_guide(state: CoachState) -> Literal["wait_for_reply", "review_item", "generate_closure"]:
+    """guide_reflection 之后路由"""
+    phase = state.get("phase", "guiding")
+    if phase == "done":
+        return "generate_closure"
+    if phase == "reviewing":
+        # 当前条目无问题，自动推进到下一条
+        return "review_item"
+    return "wait_for_reply"
 
 
 def route_after_intent(state: CoachState) -> Literal["process_response", "answer_user_question"]:
@@ -187,12 +201,20 @@ def build_graph() -> StateGraph:
         {
             "guide_reflection": "guide_reflection",
             "generate_closure": "generate_closure",
-            "wait_for_reply": "wait_for_reply",
+            "review_item": "review_item",
         }
     )
 
-    # 阶段 3: 引导 → 等待用户回复
-    builder.add_edge("guide_reflection", "wait_for_reply")
+    # 阶段 3: 引导后路由（可能自动推进到下一条或收尾）
+    builder.add_conditional_edges(
+        "guide_reflection",
+        route_after_guide,
+        {
+            "wait_for_reply": "wait_for_reply",
+            "review_item": "review_item",
+            "generate_closure": "generate_closure",
+        }
+    )
 
     # 收到回复：先识别意图
     builder.add_edge("wait_for_reply", "detect_user_intent")

@@ -824,6 +824,63 @@ def review_item(state: CoachState) -> dict:
 
     print(f"[Node] review_item: 条目{idx+1}/{len(rows)}，发现{len(normalized)}个问题项，放过{len(relaxed_ids)}项，得分{score}")
 
+    # 没有发现问题：自动推进到下一条，不走引导流程
+    if not issue_queue:
+        next_idx = idx + 1
+        if next_idx >= len(rows):
+            print(f"[Node] review_item: 所有条目均无问题，直接收尾")
+            return {
+                "review_items": review_items,
+                "score": score,
+                "all_issues": normalized,
+                "current_issue_index": 0,
+                "issue_round": 0,
+                "issue_status_map": issue_status_map,
+                "coaching_queue_order": coaching_queue_order,
+                "current_focus_id": None,
+                "pending_question": "",
+                "phase": "done",
+                "stuck_counter": 0,
+                "hint_level": 0,
+                "rubric_eval_summary": {
+                    "checked_item_ids": checked_item_ids,
+                    "matched_item_ids": [i["rubric_item_id"] for i in normalized],
+                    "relaxed_item_ids": relaxed_ids,
+                    "coverage_ok": len(checked_item_ids) == len(RUBRIC_ITEMS),
+                },
+                "messages": [AIMessage(
+                    content=f"📋 第 {idx+1}/{len(rows)} 条检查完毕，没有发现需要调整的地方。"
+                    + ("所有条目都已检查完毕，写得挺好！" if next_idx >= len(rows) else "")
+                )],
+            }
+        else:
+            print(f"[Node] review_item: 条目{idx+1}无问题，自动推进到第{next_idx+1}条")
+            return {
+                "review_items": review_items,
+                "score": score,
+                "all_issues": normalized,
+                "current_item_index": next_idx,
+                "current_issue_index": 0,
+                "issue_round": 0,
+                "issue_status_map": issue_status_map,
+                "coaching_queue_order": coaching_queue_order,
+                "current_focus_id": None,
+                "pending_question": "",
+                "phase": "reviewing",
+                "stuck_counter": 0,
+                "hint_level": 0,
+                "rubric_eval_summary": {
+                    "checked_item_ids": checked_item_ids,
+                    "matched_item_ids": [i["rubric_item_id"] for i in normalized],
+                    "relaxed_item_ids": relaxed_ids,
+                    "coverage_ok": len(checked_item_ids) == len(RUBRIC_ITEMS),
+                },
+                "messages": [AIMessage(
+                    content=f"📋 第 {idx+1}/{len(rows)} 条检查完毕，没有发现需要调整的地方。继续看下一条。"
+                )],
+            }
+
+    # 有问题项：进入引导流程
     return {
         "review_items": review_items,
         "score": score,
@@ -978,13 +1035,11 @@ def guide_reflection(state: CoachState) -> dict:
     print(f"[Node] guide_reflection: 条目{idx+1}/{total}，问题项{issue_idx+1}")
 
     if not current_review:
-        content = "当前条目尚未生成评审结果，请继续输入。"
+        return _advance_to_next_item(state, "当前条目尚未生成评审结果，跳过。")
     elif not issue_queue:
-        content = (
-            f"📋 第 {idx+1}/{total} 条\n\n"
-            "当前条目没有发现明显问题——写得挺到位的！"
-            "若你愿意，我也可以继续主动帮你做优化提问。"
-        )
+        # 无问题项：自动推进到下一条（正常情况下 review_item 已处理，
+        # 这里是防御性兜底）
+        return _advance_to_next_item(state, f"第 {idx+1}/{total} 条没有发现需要调整的地方。")
     else:
         issue = issue_queue[min(issue_idx, len(issue_queue) - 1)]
         content = _build_proactive_message(

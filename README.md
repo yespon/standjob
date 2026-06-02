@@ -43,35 +43,45 @@ standjob/
 系统完整实现了 gangbiao-coach 技能的 **阶段 0-4 生命周期**：
 
 ```
-阶段 0: 文件采集                   阶段 4: 收尾
-───────────────                   ──────────────
-START → load_standards            generate_closure
-  │ (检查进度)                       │
-  ▼                                  ▼
-wait_for_file ⏸                  wait_for_reply ⏸
-  │ (用户提供文件)                    │ (用户可继续提问)
-  ▼                                  │
-阶段 1: 结构校验                    │
+阶段 0: 文件采集                          阶段 4: 收尾
+───────────────                          ──────────────
+START → load_standards                   generate_closure
+  │ (检查进度)                              │
+  ▼                                         ▼
+wait_for_file ⏸                         wait_for_reply ⏸
+  │ (用户提供文件)                           │ (用户可继续提问)
+  ▼                                         │
+阶段 1: 结构校验                           │
 validate_structure ──(失败)──→ wait_for_file
   │ (通过)
   ▼
 阶段 2: 全面评审
-review_item ←───────────────────┐
-  │ (phase=guiding)              │
-  ▼                              │
-阶段 3: 分步引导                   │
-guide_reflection                 │
-  │                              │
-  ▼                              │
-wait_for_reply ⏸                │
-  │ (用户消息)                    │
-  ▼                              │
-detect_user_intent               │
-  ├─ question → answer_user_question ──→ wait_for_reply
-  └─ reply → process_response
-       ├─ continue → guide_reflection ─┘
-       ├─ next_item → review_item
-       └─ done → generate_closure → END
+review_item ←──────────────────────────┐
+  │                                    │
+  ├──(无问题, 自动推进)→ review_item    │  ← 下一条自动评审
+  │                                    │
+  ├──(全部完成)──→ generate_closure     │
+  │                                    │
+  └──(有问题)                          │
+       ▼                               │
+阶段 3: 分步引导                        │
+guide_reflection                       │
+  │                                    │
+  ├──(无问题兜底)→ review_item          │  ← 防御性兜底
+  │                                    │
+  ├──(全部完成)──→ generate_closure     │
+  │                                    │
+  └──(等待用户)                         │
+       ▼                               │
+  wait_for_reply ⏸                    │
+       │ (用户消息)                     │
+       ▼                               │
+  detect_user_intent                   │
+    ├─ question → answer_user_question ──→ wait_for_reply
+    └─ reply → process_response
+         ├─ continue → guide_reflection ─┘
+         ├─ next_item → review_item
+         └─ done → generate_closure → END
 ```
 
 ### 节点说明
@@ -81,8 +91,8 @@ detect_user_intent               │
 | `load_standards` | 0 | 加载内嵌的 rubric.md + textbook.md；检查是否有已保存进度，提供恢复选项 |
 | `wait_for_file` | 0 | ⏸ interrupt：等待用户上传文件 |
 | `validate_structure` | 1 | 调用 validate_sheets.py 校验文件结构，通过后提取结构化数据；失败则回退到内部 load_submission |
-| `review_item` | 2 | 对当前条目逐条对照 14 项评分标准进行评审；三问法筛选 + 灰区放过；岗位价值问题优先 |
-| `guide_reflection` | 3 | 基于引导武器表 + 自检十一问，生成苏格拉底式引导问题；遵循 肯定→切入→一问→等待 结构 |
+| `review_item` | 2 | 对当前条目逐条对照 14 项评分标准进行评审；三问法筛选 + 灰区放过；岗位价值问题优先；**无问题自动推进下一条** |
+| `guide_reflection` | 3 | 基于引导武器表 + 自检十一问，生成苏格拉底式引导问题；遵循 肯定→切入→一问→等待 结构；**无问题时自动跳过** |
 | `wait_for_reply` | 3 | ⏸ interrupt：等待用户回复 |
 | `detect_user_intent` | 3 | 规则优先意图识别，低置信度走 LLM 二判（reply / question） |
 | `process_response` | 3 | 回判三步：肯定进步→给出判断→追或不追；卡住 3 次（9 轮）自动放过 |
@@ -136,6 +146,8 @@ init → loaded → validating → reviewing → guiding → ... → done → cl
 | `guiding` | 分步引导中 |
 | `done` | 所有条目辅导完成 |
 | `closure` | 收尾总结，可继续答疑 |
+
+> **自动推进**：当 `review_item` 发现当前条目无问题时，自动设置 `phase=reviewing` 并推进到下一条，无需用户交互。仅当发现问题时才进入 `guiding` 阶段等待用户回复。
 
 ---
 

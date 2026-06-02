@@ -35,7 +35,8 @@ backend/
 | 源节点 | 路由函数 | 分支 |
 |--------|----------|------|
 | `validate_structure` | `route_after_validate` | 通过→review_item / 失败→wait_for_file |
-| `review_item` | `route_after_review` | 有问题→guide_reflection / 完成→generate_closure |
+| `review_item` | `route_after_review` | 有问题→guide_reflection / 无问题→review_item(下一条) / 全部完成→generate_closure |
+| `guide_reflection` | `route_after_guide` | 有问题项→wait_for_reply / 无问题自动推进→review_item / 全部完成→generate_closure |
 | `detect_user_intent` | `route_after_intent` | reply→process_response / question→answer_user_question |
 | `process_response` | `route_after_process_response` | reviewing→review_item / guiding→guide_reflection / done→generate_closure |
 

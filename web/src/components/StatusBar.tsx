@@ -2,6 +2,9 @@ interface Props {
   phase: string;
   loading: boolean;
   mode?: string;
+  focusId?: string | null;
+  hintLevel?: number;
+  stuckCounter?: number;
 }
 
 const PHASE_LABELS: Record<string, { label: string; color: string }> = {
@@ -17,7 +20,14 @@ const MODE_LABELS: Record<string, { label: string; color: string }> = {
   reactive_qa: { label: "被动答疑", color: "bg-orange-100 text-orange-700" },
 };
 
-export function StatusBar({ phase, loading, mode = "proactive" }: Props) {
+export function StatusBar({
+  phase,
+  loading,
+  mode = "proactive",
+  focusId,
+  hintLevel = 0,
+  stuckCounter = 0,
+}: Props) {
   const info = PHASE_LABELS[phase] || PHASE_LABELS.init;
   const modeInfo = MODE_LABELS[mode] || MODE_LABELS.proactive;
 
@@ -36,6 +46,21 @@ export function StatusBar({ phase, loading, mode = "proactive" }: Props) {
       >
         {modeInfo.label}
       </span>
+      {focusId && (
+        <span className="text-xs font-medium px-2.5 py-1 rounded-full bg-sky-100 text-sky-700">
+          焦点项 #{focusId}
+        </span>
+      )}
+      {hintLevel > 0 && (
+        <span className="text-xs font-medium px-2.5 py-1 rounded-full bg-amber-100 text-amber-700">
+          提示等级 {hintLevel}
+        </span>
+      )}
+      {stuckCounter > 0 && (
+        <span className="text-xs font-medium px-2.5 py-1 rounded-full bg-rose-100 text-rose-700">
+          卡点次数 {stuckCounter}
+        </span>
+      )}
     </div>
   );
 }

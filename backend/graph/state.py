@@ -6,6 +6,33 @@ from typing import Annotated, Any, Optional, TypedDict
 from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage
 
+# ─────────────────────────────────────────────────────────────
+# 评审标准项定义（14项评分标准）
+# ─────────────────────────────────────────────────────────────
+RUBRIC_ITEMS: list[dict[str, Any]] = [
+    {"id": 1, "category": "岗位价值", "level": "A", "desc": "站在自身视角而不是站在客户视角提炼岗位价值"},
+    {"id": 2, "category": "岗位价值", "level": "A", "desc": "岗位价值并非源于对客户最在意、最深层需求的提炼"},
+    {"id": 3, "category": "岗位价值", "level": "A", "desc": "没有从不同客户的视角出发，去提炼岗位价值"},
+    {"id": 4, "category": "岗位价值", "level": "A", "desc": "岗位价值描述空泛，指导性不强"},
+    {"id": 5, "category": "岗位效能", "level": "A", "desc": "岗位效能并不能直接、有效地衡量岗位价值"},
+    {"id": 6, "category": "岗位任务", "level": "A", "desc": "核心任务的目的集合无法完整覆盖岗位价值"},
+    {"id": 7, "category": "岗位任务", "level": "B", "desc": "任务命名未按动词+修饰语+名词"},
+    {"id": 8, "category": "岗位任务", "level": "B", "desc": "直接用目的命名任务"},
+    {"id": 9, "category": "任务目的与成果", "level": "A", "desc": "任务目的模糊，导致为何而做不清"},
+    {"id": 10, "category": "任务目的与成果", "level": "A", "desc": "成果标准与任务目的脱节"},
+    {"id": 11, "category": "任务目的与成果", "level": "A", "desc": "任务成果评估周期设计过长"},
+    {"id": 12, "category": "任务目的与成果", "level": "A", "desc": "成果标准不符合SMART原则"},
+    {"id": 13, "category": "任务目的与成果", "level": "A", "desc": "把交付物当做成果"},
+    {"id": 14, "category": "任务目的与成果", "level": "A", "desc": "成果标准未在完成度、交期、预算上设计挑战目标"},
+]
+
+RUBRIC_INDEX = {item["id"]: item for item in RUBRIC_ITEMS}
+
+# 三问法关键词（用于严格度校准）
+WHO_HINTS = ("客户", "用户", "产品经理", "研发", "业务", "销售", "团队", "测试", "运营")
+BENEFIT_HINTS = ("减少", "提升", "降低", "提高", "保障", "避免", "缩短", "稳定", "改善")
+BIZ_HINTS = ("收入", "成本", "风险", "品牌", "口碑", "市场", "利润", "效率")
+
 
 class IssueItem(TypedDict):
     """评审发现的单个问题项（内部结构）"""
@@ -32,6 +59,7 @@ class MatchedIssue(TypedDict):
 class IssueProgress(TypedDict):
     """问题项逐项引导进度。"""
     issue_id: str
+    rubric_item_id: int
     issue_desc: str
     category: str
     status: str              # pending | in_progress | resolved
@@ -50,6 +78,14 @@ class ReviewItem(TypedDict):
     standard_ref: str
     status: str
     issue_queue: list[IssueProgress]
+
+
+class RubricEvalSummary(TypedDict):
+    """单条目评审覆盖情况（内部追踪，不对用户展示）。"""
+    checked_item_ids: list[int]      # 已检查的评分项ID列表
+    matched_item_ids: list[int]      # 命中问题的评分项ID列表
+    relaxed_item_ids: list[int]      # 灰区放过的评分项ID列表
+    coverage_ok: bool                # 是否完整覆盖所有评分项
 
 
 class CoachState(TypedDict):
@@ -79,6 +115,12 @@ class CoachState(TypedDict):
     issue_status_map: dict[str, str]   # issue_id -> pending/in_progress/resolved
     review_items: list[ReviewItem]     # 当前实现按条目生成的评审结果
     current_item_index: int            # 当前正在引导的条目索引
+    rubric_eval_summary: RubricEvalSummary  # 评分标准覆盖情况追踪
+    coaching_queue_order: list[str]    # 辅导问题队列顺序
+    current_focus_id: Optional[str]    # 当前聚焦的问题项ID
+    stuck_counter: int                 # 用户卡住计数器（用于升级提示）
+    hint_level: int                    # 当前提示级别（1-3）
+    closure_summary: Optional[str]     # 收尾总结
 
     # ── 当前轮次辅导上下文 ──────────────────────────────────────
     pending_question: Optional[str]    # 待发给用户的引导问题

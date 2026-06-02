@@ -11,6 +11,10 @@ export interface StartSessionResponse {
   phase: string;
   next_nodes: string[];
   active_mode: string;
+  current_focus_id?: string | null;
+  stuck_counter?: number;
+  hint_level?: number;
+  closure_summary?: string | null;
 }
 
 export interface ChatResponse {
@@ -18,6 +22,10 @@ export interface ChatResponse {
   phase: string;
   next_nodes: string[];
   active_mode: string;
+  current_focus_id?: string | null;
+  stuck_counter?: number;
+  hint_level?: number;
+  closure_summary?: string | null;
 }
 
 export interface SessionState {
@@ -27,6 +35,16 @@ export interface SessionState {
   total_items: number;
   reflection_round: number;
   active_mode: string;
+  current_focus_id?: string | null;
+  stuck_counter?: number;
+  hint_level?: number;
+  closure_summary?: string | null;
+  rubric_eval_summary?: {
+    checked_item_ids?: number[];
+    matched_item_ids?: number[];
+    relaxed_item_ids?: number[];
+    coverage_ok?: boolean;
+  };
 }
 
 export interface UploadResponse {
@@ -37,7 +55,7 @@ export interface UploadResponse {
 export interface SSECallbacks {
   onSession?: (threadId: string) => void;
   onMessage: (msg: ChatMessage) => void;
-  onDone: (phase: string, nextNodes: string[], activeMode: string) => void;
+  onDone: (state: SessionState) => void;
   onError?: (error: string) => void;
 }
 
@@ -73,7 +91,19 @@ async function consumeSSE(response: Response, callbacks: SSECallbacks) {
             callbacks.onError?.(data.detail || "未知错误");
             break;
           case "done":
-            callbacks.onDone(data.phase, data.next_nodes, data.active_mode || "proactive");
+            callbacks.onDone({
+              phase: data.phase,
+              next_nodes: data.next_nodes || [],
+              current_item_index: data.current_item_index || 0,
+              total_items: data.total_items || 0,
+              reflection_round: data.reflection_round || 0,
+              active_mode: data.active_mode || "proactive",
+              current_focus_id: data.current_focus_id,
+              stuck_counter: data.stuck_counter || 0,
+              hint_level: data.hint_level || 0,
+              closure_summary: data.closure_summary || null,
+              rubric_eval_summary: data.rubric_eval_summary || {},
+            });
             break;
         }
         eventType = "";

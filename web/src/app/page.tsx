@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import {
   ChatMessage,
+  SessionState,
   startSessionStream,
   sendMessageStream,
   uploadFile,
@@ -18,6 +19,10 @@ export default function Home() {
   const [phase, setPhase] = useState("init");
   const [activeMode, setActiveMode] = useState("proactive");
   const [nextNodes, setNextNodes] = useState<string[]>([]);
+  const [currentFocusId, setCurrentFocusId] = useState<string | null>(null);
+  const [hintLevel, setHintLevel] = useState(0);
+  const [stuckCounter, setStuckCounter] = useState(0);
+  const [closureSummary, setClosureSummary] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -30,6 +35,16 @@ export default function Home() {
     scrollToBottom();
   }, [messages, scrollToBottom]);
 
+  const applyState = useCallback((state: SessionState) => {
+    setPhase(state.phase);
+    setNextNodes(state.next_nodes);
+    setActiveMode(state.active_mode);
+    setCurrentFocusId(state.current_focus_id || null);
+    setHintLevel(state.hint_level || 0);
+    setStuckCounter(state.stuck_counter || 0);
+    setClosureSummary(state.closure_summary || null);
+  }, []);
+
   // 启动会话（流式）
   const handleStart = useCallback(async () => {
     setLoading(true);
@@ -38,18 +53,14 @@ export default function Home() {
       await startSessionStream({
         onSession: (id) => setThreadId(id),
         onMessage: (msg) => setMessages((prev) => [...prev, msg]),
-        onDone: (p, nodes, mode) => {
-          setPhase(p);
-          setNextNodes(nodes);
-          setActiveMode(mode);
-        },
+        onDone: applyState,
       });
     } catch (e) {
       setError(e instanceof Error ? e.message : "启动失败");
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [applyState]);
 
   useEffect(() => {
     handleStart();
@@ -62,22 +73,22 @@ export default function Home() {
     setPhase("init");
     setActiveMode("proactive");
     setNextNodes([]);
+    setCurrentFocusId(null);
+    setHintLevel(0);
+    setStuckCounter(0);
+    setClosureSummary(null);
     setError("会话已过期，正在重新连接...");
     try {
       await startSessionStream({
         onSession: (id) => setThreadId(id),
         onMessage: (msg) => setMessages((prev) => [...prev, msg]),
-        onDone: (p, nodes, mode) => {
-          setPhase(p);
-          setNextNodes(nodes);
-          setActiveMode(mode);
-        },
+        onDone: applyState,
       });
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "重连失败，请刷新页面");
     }
-  }, []);
+  }, [applyState]);
 
   // 发送文本消息（流式）
   const handleSend = async (text: string) => {
@@ -91,11 +102,7 @@ export default function Home() {
     try {
       await sendMessageStream(threadId, text, undefined, {
         onMessage: (msg) => setMessages((prev) => [...prev, msg]),
-        onDone: (p, nodes, mode) => {
-          setPhase(p);
-          setNextNodes(nodes);
-          setActiveMode(mode);
-        },
+        onDone: applyState,
         onError: (detail) => setError(detail),
       });
     } catch (e) {
@@ -134,11 +141,7 @@ export default function Home() {
         uploadRes.file_path,
         {
           onMessage: (msg) => setMessages((prev) => [...prev, msg]),
-          onDone: (p, nodes, mode) => {
-            setPhase(p);
-            setNextNodes(nodes);
-            setActiveMode(mode);
-          },
+          onDone: applyState,
           onError: (detail) => setError(detail),
         }
       );
@@ -170,7 +173,14 @@ export default function Home() {
               基于 AI 的智能辅导
             </p>
           </div>
-          <StatusBar phase={phase} loading={loading} mode={activeMode} />
+          <StatusBar
+            phase={phase}
+            loading={loading}
+            mode={activeMode}
+            focusId={currentFocusId}
+            hintLevel={hintLevel}
+            stuckCounter={stuckCounter}
+          />
         </div>
       </header>
 
@@ -200,7 +210,7 @@ export default function Home() {
 
           {isDone && messages.length > 0 && (
             <div className="text-center text-gray-500 text-sm py-4">
-              主动引导已完成，可继续提问进入被动答疑
+              {closureSummary || "主动引导已完成，可继续提问进入被动答疑"}
             </div>
           )}
 

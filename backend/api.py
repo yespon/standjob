@@ -47,6 +47,10 @@ class StartSessionResponse(BaseModel):
     phase: str
     next_nodes: list[str]
     active_mode: str = "proactive"
+    current_focus_id: str | None = None
+    stuck_counter: int = 0
+    hint_level: int = 0
+    closure_summary: str | None = None
 
 
 class SendMessageRequest(BaseModel):
@@ -60,6 +64,10 @@ class ChatResponse(BaseModel):
     phase: str
     next_nodes: list[str]
     active_mode: str = "proactive"
+    current_focus_id: str | None = None
+    stuck_counter: int = 0
+    hint_level: int = 0
+    closure_summary: str | None = None
 
 
 class StateResponse(BaseModel):
@@ -69,6 +77,30 @@ class StateResponse(BaseModel):
     total_items: int
     reflection_round: int
     active_mode: str = "proactive"
+    current_focus_id: str | None = None
+    stuck_counter: int = 0
+    hint_level: int = 0
+    closure_summary: str | None = None
+    rubric_eval_summary: dict = {}
+
+
+def _state_snapshot(config: dict) -> dict:
+    """提取前后端共享的会话状态快照。"""
+    state = graph.get_state(config)
+    values = state.values
+    return {
+        "phase": values.get("phase", "init"),
+        "next_nodes": list(state.next) if state.next else [],
+        "active_mode": values.get("active_mode", "proactive"),
+        "current_item_index": values.get("current_item_index", 0),
+        "total_items": len(values.get("submission_rows", [])),
+        "reflection_round": values.get("reflection_round", 0),
+        "current_focus_id": values.get("current_focus_id"),
+        "stuck_counter": values.get("stuck_counter", 0),
+        "hint_level": values.get("hint_level", 0),
+        "closure_summary": values.get("closure_summary"),
+        "rubric_eval_summary": values.get("rubric_eval_summary", {}),
+    }
 
 
 # ── API 端点 ────────────────────────────────────────────────
@@ -88,17 +120,18 @@ def start_session():
                 if msg_dict not in ai_messages:
                     ai_messages.append(msg_dict)
 
-    state = graph.get_state(config)
-    phase = state.values.get("phase", "init")
-    next_nodes = list(state.next) if state.next else []
-    active_mode = state.values.get("active_mode", "proactive")
+    snapshot = _state_snapshot(config)
 
     return StartSessionResponse(
         thread_id=thread_id,
         messages=ai_messages,
-        phase=phase,
-        next_nodes=next_nodes,
-        active_mode=active_mode,
+        phase=snapshot["phase"],
+        next_nodes=snapshot["next_nodes"],
+        active_mode=snapshot["active_mode"],
+        current_focus_id=snapshot["current_focus_id"],
+        stuck_counter=snapshot["stuck_counter"],
+        hint_level=snapshot["hint_level"],
+        closure_summary=snapshot["closure_summary"],
     )
 
 
@@ -135,16 +168,17 @@ def chat(req: SendMessageRequest):
 
     ai_messages = [{"role": "assistant", "content": c} for c in ai_contents]
 
-    state = graph.get_state(config)
-    phase = state.values.get("phase", "init")
-    next_nodes = list(state.next) if state.next else []
-    active_mode = state.values.get("active_mode", "proactive")
+    snapshot = _state_snapshot(config)
 
     return ChatResponse(
         messages=ai_messages,
-        phase=phase,
-        next_nodes=next_nodes,
-        active_mode=active_mode,
+        phase=snapshot["phase"],
+        next_nodes=snapshot["next_nodes"],
+        active_mode=snapshot["active_mode"],
+        current_focus_id=snapshot["current_focus_id"],
+        stuck_counter=snapshot["stuck_counter"],
+        hint_level=snapshot["hint_level"],
+        closure_summary=snapshot["closure_summary"],
     )
 
 
@@ -160,14 +194,19 @@ def get_session_state(thread_id: str):
     except Exception:
         raise HTTPException(status_code=404, detail="会话不存在")
 
-    values = state.values
+    snapshot = _state_snapshot(config)
     return StateResponse(
-        phase=values.get("phase", "init"),
-        next_nodes=list(state.next) if state.next else [],
-        current_item_index=values.get("current_item_index", 0),
-        total_items=len(values.get("submission_rows", [])),
-        reflection_round=values.get("reflection_round", 0),
-        active_mode=values.get("active_mode", "proactive"),
+        phase=snapshot["phase"],
+        next_nodes=snapshot["next_nodes"],
+        current_item_index=snapshot["current_item_index"],
+        total_items=snapshot["total_items"],
+        reflection_round=snapshot["reflection_round"],
+        active_mode=snapshot["active_mode"],
+        current_focus_id=snapshot["current_focus_id"],
+        stuck_counter=snapshot["stuck_counter"],
+        hint_level=snapshot["hint_level"],
+        closure_summary=snapshot["closure_summary"],
+        rubric_eval_summary=snapshot["rubric_eval_summary"],
     )
 
 
@@ -198,11 +237,8 @@ def start_session_stream():
                         "content": m.content,
                     })
 
-        state = graph.get_state(config)
-        phase = state.values.get("phase", "init")
-        next_nodes = list(state.next) if state.next else []
-        active_mode = state.values.get("active_mode", "proactive")
-        yield _sse_event("done", {"phase": phase, "next_nodes": next_nodes, "active_mode": active_mode})
+        snapshot = _state_snapshot(config)
+        yield _sse_event("done", snapshot)
 
     return StreamingResponse(generate(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache",
@@ -255,11 +291,8 @@ def chat_stream(req: SendMessageRequest):
             traceback.print_exc()
             yield _sse_event("error", {"detail": f"处理出错：{type(e).__name__}: {str(e)[:200]}"})
 
-        state = graph.get_state(config)
-        phase = state.values.get("phase", "init")
-        next_nodes = list(state.next) if state.next else []
-        active_mode = state.values.get("active_mode", "proactive")
-        yield _sse_event("done", {"phase": phase, "next_nodes": next_nodes, "active_mode": active_mode})
+        snapshot = _state_snapshot(config)
+        yield _sse_event("done", snapshot)
 
     return StreamingResponse(generate(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache",

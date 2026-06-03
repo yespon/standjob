@@ -11,11 +11,15 @@
 item 编号: 1-14 对应评分标准条目
 status: pending / fail / pass / skip
 """
+import os
 import sys
 import json
 from pathlib import Path
 
-PROGRESS_FILE = Path("/tmp/gangbiao-coach-progress.json")
+# 进度文件路径可由环境变量覆盖，以便按会话（thread_id）隔离，避免多用户串号。
+PROGRESS_FILE = Path(
+    os.environ.get("STANDJOB_PROGRESS_FILE", "/tmp/gangbiao-coach-progress.json")
+)
 
 
 def load():

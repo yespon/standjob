@@ -14,17 +14,23 @@ from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage
 
 # ─────────────────────────────────────────────────────────────
-# 评审标准项定义（14 项评分标准，来自 rubric.md）
+# 评审标准项定义（14 项评分标准 + 问题项 0 客户定义，来自 rubric.md）
 # ─────────────────────────────────────────────────────────────
 RUBRIC_ITEMS: list[dict[str, Any]] = [
+    # 问题项 0：关键客户定义（优先于岗位价值，来自 chapter-map.md）
+    {"id": 0, "category": "客户定义", "level": "A", "desc": "关键客户画像不清晰，无法明确服务对象的特征与需求"},
+    # 问题项 1-4：岗位价值
     {"id": 1, "category": "岗位价值", "level": "A", "desc": "站在自身视角而不是站在客户视角提炼岗位价值"},
     {"id": 2, "category": "岗位价值", "level": "A", "desc": "岗位价值并非源于对客户最在意、最深层需求的提炼"},
     {"id": 3, "category": "岗位价值", "level": "A", "desc": "没有从不同客户的视角出发，去提炼岗位价值"},
     {"id": 4, "category": "岗位价值", "level": "A", "desc": "岗位价值描述空泛，指导性不强"},
+    # 问题项 5：岗位效能
     {"id": 5, "category": "岗位效能", "level": "A", "desc": "岗位效能并不能直接、有效地衡量岗位价值"},
+    # 问题项 6-8：岗位任务
     {"id": 6, "category": "岗位任务", "level": "A", "desc": "核心任务的目的集合无法完整覆盖岗位价值"},
     {"id": 7, "category": "岗位任务", "level": "B", "desc": "任务命名未按动词+修饰语+名词"},
     {"id": 8, "category": "岗位任务", "level": "B", "desc": "直接用目的命名任务"},
+    # 问题项 9-14：任务目的与成果
     {"id": 9, "category": "任务目的与成果", "level": "A", "desc": "任务目的模糊，导致为何而做不清"},
     {"id": 10, "category": "任务目的与成果", "level": "A", "desc": "成果标准与任务目的脱节"},
     {"id": 11, "category": "任务目的与成果", "level": "A", "desc": "任务成果评估周期设计过长"},
@@ -43,65 +49,83 @@ BIZ_HINTS = ("收入", "成本", "风险", "品牌", "口碑", "市场", "利润
 
 # ─────────────────────────────────────────────────────────────
 # 引导武器表（按问题类型对应的苏格拉底式提问风格）
-# 来自 skill v2 的引导武器表 + textbook.md 自检十一问
+# 来自 textbook.md 案例 + 自检十一问，用人话表达
 # ─────────────────────────────────────────────────────────────
 GUIDANCE_WEAPONS: dict[str, dict[str, str]] = {
-    # rubric item id → {"question_style": "引导话术", "textbook_ref": "教材对应"}
+    # 问题项 0：关键客户定义
+    "0": {
+        "question_style": "先别急着写价值——我问你个实在的：你这岗位最主要是伺候谁？用一句话说说这人的角色、他每天烦什么，行吗？",
+        "textbook_ref": "第1-2章：锁定关键客户的三步决策——明确客户画像、价值排序、精准洞察",
+    },
+    # 问题项 1：视角偏差
     "1": {
-        "question_style": "你写的这些，如果我是你的客户，我能从中看到'我得到了什么'吗？",
-        "textbook_ref": "自检一：价值错位——罗列'我的工作'而非承诺'你的收获'",
+        "question_style": "你看啊，你写的这段更像是在说'我干了啥'。但如果我是你客户，我读完后能直接看到'我得到了啥'吗？",
+        "textbook_ref": "第3章：视角偏差陷阱——从'我能做什么'转向'你能得到什么'",
     },
+    # 问题项 2：需求偏差
     "2": {
-        "question_style": "客户说想要 A，你确定 A 就是他们真正需要的吗？还是他们自己开的药方？",
-        "textbook_ref": "自检二：需求偏差——错把'客户药方'当'问题症结'",
+        "question_style": "客户跟你说'我要这个'，你确定这就是他真正缺的？还是他自己开的药方？比如他说要培训，真问题会不会是新人开不了单？",
+        "textbook_ref": "第3章：深度偏差——错把客户药方当问题症结",
     },
+    # 问题项 3：价值粗放
     "3": {
-        "question_style": "试着对每个关键客户分别说一句核心价值——如果听起来都差不多，可能还没区分到位。",
-        "textbook_ref": "自检三：价值粗放——用'通用承诺'应付所有客户",
+        "question_style": "你列了好几个客户，但给每个人的价值听起来都差不多。试着给每个客户分别说一句——如果听起来像一个模子刻的，可能还没区分到位。",
+        "textbook_ref": "第3章：多客户岗位必须分别定义价值",
     },
+    # 问题项 4：描述空泛
     "4": {
-        "question_style": "试着把'助力业务成功'换成一句更具体的——你到底帮谁、帮成什么样？",
-        "textbook_ref": "自检一/三：价值错位/粗放",
+        "question_style": "'助力业务成功'这种话听起来挺对，但具体到你是谁、帮谁、帮成什么样，就有点虚了。你能把它换成一句更实在的吗？",
+        "textbook_ref": "第3章：标准表述——为谁创造价值 + 创造何种具体价值",
     },
+    # 问题项 5：效能脱节
     "5": {
-        "question_style": "你列的这些指标，跟上面说的价值能对上号吗？一一过一遍？",
-        "textbook_ref": "教材第4章：岗位效能——从价值定义到量化追踪",
+        "question_style": "你写的这些指标，跟你上面说的价值能对上号吗？比如你说减少缺陷，那指标里有缺陷率吗？咱们一过一过？",
+        "textbook_ref": "第4章：效能必须与价值一一对应、同频共振",
     },
+    # 问题项 6：价值任务脱钩
     "6": {
-        "question_style": "每项价值 → 必须打赢的关键战役有哪些？反过来，每项任务 → 直接支撑了哪一个价值？",
-        "textbook_ref": "自检四：价值任务脱钩——'承诺'与'行动'各说各话",
+        "question_style": "来，咱们玩个双向对账：你列的每项价值，背后都有任务撑着吗？反过来，每项任务又具体撑了哪项价值？",
+        "textbook_ref": "第5章：核心任务的目的集合必须完整覆盖岗位价值",
     },
+    # 问题项 7：命名格式
     "7": {
-        "question_style": "看到这个任务名，一个新人能直接知道该干什么吗？还是得先猜？",
-        "textbook_ref": "自检五：任务虚化——将'目的'误作'任务'",
+        "question_style": "你这个任务名——'详细设计'、'需求评审'——新人看了能直接知道要干啥吗？还是得像猜谜一样琢磨？",
+        "textbook_ref": "第5章：动词+修饰语+名词——如'整理客户拜访纪要'",
     },
+    # 问题项 8：用目的命名
     "8": {
-        "question_style": "这个名字说的是'想要什么结果'，而不是'要做什么动作'——能感觉到区别吗？",
-        "textbook_ref": "自检五：任务虚化——将'目的'误作'任务'",
+        "question_style": "'降低产品成本'——这是你想要的结果，不是你能直接动手做的动作。如果把任务名改成'一看就知道要干啥'，你会怎么写？",
+        "textbook_ref": "第5章：终结习惯性执行——停摆推演法",
     },
+    # 问题项 9：目的模糊
     "9": {
-        "question_style": "如果有人问你这个任务到底'为啥要做'，你能一句话说清吗？",
-        "textbook_ref": "自检六/七：目的错位/虚焦",
+        "question_style": "如果有人问你'做这个任务到底图啥'，你能一句话说清吗？不说'完成任务'这种虚的。",
+        "textbook_ref": "第5章/第9章自检六：目的必须包含'旨在…''为了…'",
     },
+    # 问题项 10：成果脱节
     "10": {
-        "question_style": "你写的成果，真的能证明这个目的达到了吗？",
-        "textbook_ref": "自检九：目的悬空——目的缺乏可衡量成果标准",
+        "question_style": "你写的成果，能直接证明目的达到了吗？比如目的是'一次性解决'，成果却是'响应时效'，这俩就对不上。",
+        "textbook_ref": "第7章：先定目的，再定成果——成果必须回应目的关键词",
     },
+    # 问题项 11：反馈迟滞
     "11": {
-        "question_style": "这个反馈周期，能不能在出问题的第一时间就发现？",
-        "textbook_ref": "自检十一：反馈迟滞——反馈周期过长",
+        "question_style": "你这个成果，得等多久才能知道有没有问题？能不能做到当天或者当周就发现问题？",
+        "textbook_ref": "第9章自检十一：高频任务必须配短周期评估",
     },
+    # 问题项 12：不符合 SMART
     "12": {
-        "question_style": "这个指标，换个人来量，能得出一样的数吗？",
-        "textbook_ref": "自检十：评价异化——管理依赖'主观考试'",
+        "question_style": "这个指标换个人来量，能得出一样的数吗？比如'质量好'就挺主观，但'缺陷率≤0.5%'谁量都一样。",
+        "textbook_ref": "第7章：成果标准需具体、可衡量、可达成、相关、有时限",
     },
+    # 问题项 13：交付物当成果
     "13": {
-        "question_style": "交了文档和达到目的，是一回事吗？",
-        "textbook_ref": "教材第8章：交付陷阱——从'提交文件'到'实现目的'",
+        "question_style": "'交付XX文档'——交了文档不等于目的达到了。客户真正要的是文档里的东西解决了他的问题，对吧？",
+        "textbook_ref": "第8章：交付陷阱——从'提交文件'到'实现目的'",
     },
+    # 问题项 14：无挑战目标
     "14": {
-        "question_style": "在完成度、交期、预算三个维度上，你的目标设得够有挑战性吗？",
-        "textbook_ref": "教材第7章：任务成果——三维坐标",
+        "question_style": "完成度、交期、预算这三块，你设的目标够有挑战性吗？还是保守到肯定能完成？",
+        "textbook_ref": "第7章：三维坐标（完成度/交期/预算）均应设计为挑战目标",
     },
 }
 
@@ -144,8 +168,7 @@ class IssueItem(TypedDict):
     issue_id: str
     issue_desc: str
     category: str
-    level: str
-    deduction: int
+    level: str              # A=重点关注，B=可优化（仅内部排序，不给用户展示）
     explanation: str
     teaching_ref: str
     guided: bool
@@ -156,8 +179,7 @@ class MatchedIssue(TypedDict):
     issue_id: str
     issue_desc: str
     category: str
-    level: str
-    deduction: int
+    level: str              # A=重点关注，B=可优化
     explanation: str
 
 
@@ -228,23 +250,27 @@ class CoachState(TypedDict):
     structure_errors: list[str]        # 结构校验错误信息
 
     # ── 评审结果 ────────────────────────────────────────────────
-    all_issues: list[IssueItem]        # 一次性评审发现的所有问题
-    score: int                         # 总分（100 - 所有扣分之和）
+    all_issues: list[IssueItem]        # 一次性评审发现的所有问题（内部诊断用，不给用户展示）
+    # 注意：skill 要求不给用户打分，所以没有 score 字段
     current_issue_index: int           # 当前问题项索引
     issue_round: int                   # 当前问题项追问轮次
     issue_status_map: dict[str, str]   # issue_id -> pending/in_progress/resolved
     review_items: list[ReviewItem]     # 按条目生成的评审结果
     current_item_index: int            # 当前正在引导的条目索引
-    rubric_eval_summary: RubricEvalSummary  # 评分标准覆盖情况追踪
+    rubric_eval_summary: RubricEvalSummary  # 评分标准覆盖情况追踪（内部用）
     coaching_queue_order: list[str]    # 辅导问题队列顺序
     current_focus_id: Optional[str]    # 当前聚焦的问题项ID
     stuck_counter: int                 # 用户卡住计数器（用于升级提示）
     hint_level: int                    # 当前提示级别（1-3）
 
+    # ── 双线推进状态（skill 要求：线1完成后才进入线2）──────────────────
+    current_line: int                  # 1 = 线1(客户-价值-效能), 2 = 线2(任务-目的-成果)
+    line1_completed: bool              # 线1是否全部完成
+
     # ── 当前轮次辅导上下文 ──────────────────────────────────────
     pending_question: Optional[str]    # 待发给用户的引导问题
     awaiting_user_input: bool          # 是否等待用户回复
-    reflection_round: int              # 当前问题已追问轮次（最多 3 轮）
+    # issue_round 追踪当前问题已追问轮次（最多 3 轮）
 
     # ── 收尾 ──────────────────────────────────────────────────
     closure_summary: Optional[str]     # 收尾总结

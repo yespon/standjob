@@ -37,7 +37,9 @@ from __future__ import annotations
 from typing import Literal
 
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
+import sqlite3
+import os
 
 from .state import CoachState
 from .nodes import (
@@ -56,11 +58,6 @@ from .nodes import (
 # 条件边：判断当前应走哪个分支
 # ─────────────────────────────────────────────────────────────
 
-def route_after_load(state: CoachState) -> Literal["wait_for_file"]:
-    """load_standards 之后：等待用户上传文件"""
-    return "wait_for_file"
-
-
 def route_after_validate(state: CoachState) -> Literal["wait_for_file", "review_item"]:
     """
     validate_structure 之后：
@@ -72,26 +69,26 @@ def route_after_validate(state: CoachState) -> Literal["wait_for_file", "review_
     return "review_item"
 
 
-def route_after_review(state: CoachState) -> Literal["guide_reflection", "generate_closure", "review_item"]:
-    """review_item 之后路由"""
-    phase = state.get("phase", "guiding")
-    if phase == "done":
-        return "generate_closure"
-    if phase == "reviewing":
-        # 当前条目无问题，自动推进到下一条
-        return "review_item"
-    return "guide_reflection"
+def route_by_phase(default_target: str):
+    """工厂：生成一个按 phase 分发的路由函数。
 
-
-def route_after_guide(state: CoachState) -> Literal["wait_for_reply", "review_item", "generate_closure"]:
-    """guide_reflection 之后路由"""
-    phase = state.get("phase", "guiding")
-    if phase == "done":
-        return "generate_closure"
-    if phase == "reviewing":
-        # 当前条目无问题，自动推进到下一条
-        return "review_item"
-    return "wait_for_reply"
+    三处条件边（review_item / guide_reflection / process_response）后续路由
+    共享同一套 phase 分发，仅"继续"分支的落点不同，用 default_target 区分：
+      - phase == "done"      → generate_closure（收尾）
+      - phase == "reviewing" → review_item（有新条目待评审/无问题自动推进）
+      - phase == "closure"   → wait_for_reply（已在收尾流程，等待继续提问）
+      - 其他（guiding 等）    → default_target
+    """
+    def _route(state: CoachState) -> str:
+        phase = state.get("phase", "guiding")
+        if phase == "done":
+            return "generate_closure"
+        if phase == "reviewing":
+            return "review_item"
+        if phase == "closure":
+            return "wait_for_reply"
+        return default_target
+    return _route
 
 
 def route_after_intent(state: CoachState) -> Literal["process_response", "answer_user_question"]:
@@ -100,32 +97,6 @@ def route_after_intent(state: CoachState) -> Literal["process_response", "answer
     if intent == "question":
         return "answer_user_question"
     return "process_response"
-
-
-def route_after_process_response(state: CoachState) -> Literal[
-    "review_item", "guide_reflection", "generate_closure", "wait_for_reply"
-]:
-    """
-    process_response 之后的路由：
-    - phase="done"        → 收尾
-    - phase="reviewing"   → 有新条目待评审 → review_item
-    - phase="guiding"     → 继续当前条目引导 → guide_reflection
-    - phase="closure"     → 已在收尾流程
-    """
-    phase = state.get("phase", "guiding")
-    if phase == "done":
-        return "generate_closure"
-    elif phase == "reviewing":
-        return "review_item"
-    elif phase in {"closure"}:
-        return "wait_for_reply"
-    else:
-        return "guide_reflection"
-
-
-def route_after_closure(state: CoachState) -> Literal["wait_for_reply", "END"]:
-    """收尾之后：等待用户继续提问或结束"""
-    return "wait_for_reply"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -197,18 +168,19 @@ def build_graph() -> StateGraph:
     # 阶段 2: 评审后路由
     builder.add_conditional_edges(
         "review_item",
-        route_after_review,
+        route_by_phase("guide_reflection"),
         {
             "guide_reflection": "guide_reflection",
             "generate_closure": "generate_closure",
             "review_item": "review_item",
+            "wait_for_reply": "wait_for_reply",
         }
     )
 
     # 阶段 3: 引导后路由（可能自动推进到下一条或收尾）
     builder.add_conditional_edges(
         "guide_reflection",
-        route_after_guide,
+        route_by_phase("wait_for_reply"),
         {
             "wait_for_reply": "wait_for_reply",
             "review_item": "review_item",
@@ -235,7 +207,7 @@ def build_graph() -> StateGraph:
     # 处理回复后的分支
     builder.add_conditional_edges(
         "process_response",
-        route_after_process_response,
+        route_by_phase("guide_reflection"),
         {
             "review_item": "review_item",
             "guide_reflection": "guide_reflection",
@@ -248,9 +220,13 @@ def build_graph() -> StateGraph:
     builder.add_edge("generate_closure", "wait_for_reply")
 
     # ── 编译（interrupt_before 让 wait 节点暂停等待用户输入） ──
-    memory = MemorySaver()
+    # 使用 SqliteSaver 持久化会话状态，进程重启后仍可恢复。
+    db_path = os.environ.get("STANDJOB_CHECKPOINT_DB", "/tmp/standjob_checkpoints.sqlite")
+    # SQLite 连接需要在多线程环境使用 check_same_thread=False
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    checkpointer = SqliteSaver(conn)
     graph = builder.compile(
-        checkpointer=memory,
+        checkpointer=checkpointer,
         interrupt_before=["wait_for_file", "wait_for_reply"],
     )
 
@@ -283,19 +259,21 @@ def send_user_message(
 
     graph.update_state(config, update)
 
-    # 预填充已有 AI 消息，避免重复返回历史消息
+    # 记录已有 AI 消息的 id，只返回本次新产生的消息。
+    # 用 id 而非 content 去重：两个不同问题项可能生成相同文案，
+    # 按 content 去重会把第二条静默吞掉，导致用户看不到回复。
     pre_state = graph.get_state(config)
-    seen: set[str] = set()
+    seen_ids: set[str] = set()
     for m in pre_state.values.get("messages", []):
         if isinstance(m, AIMessage):
-            seen.add(m.content)
+            seen_ids.add(m.id)
 
     ai_outputs: list[str] = []
     for chunk in graph.stream(None, config, stream_mode="values"):
         msgs = chunk.get("messages", [])
         for m in msgs:
-            if isinstance(m, AIMessage) and m.content not in seen:
-                seen.add(m.content)
+            if isinstance(m, AIMessage) and m.id not in seen_ids:
+                seen_ids.add(m.id)
                 ai_outputs.append(m.content)
 
     return ai_outputs

@@ -1,0 +1,264 @@
+[
+  {
+    "turn": "init",
+    "ai": [
+      "来，先把你的材料给我看看——把《岗位价值与岗位任务》那个 Excel 的路径发我"
+    ],
+    "state": {
+      "phase": "loaded",
+      "active_mode": null,
+      "last_user_intent": null,
+      "current_item_index": null,
+      "current_issue_index": null,
+      "issue_round": null,
+      "stuck_counter": null,
+      "hint_level": null,
+      "current_focus_id": null,
+      "current_line": null,
+      "line1_completed": null,
+      "next": [
+        "wait_for_file"
+      ],
+      "total_items": 0
+    }
+  },
+  {
+    "turn": "upload",
+    "ai": [
+      "材料收到了，我过了一遍，该有的都有——咱们直接进入正题。",
+      "📋 第 1/3 条\n\n✅ 你岗位价值这块写得挺实在的，我们来看一个可以更精准的地"
+    ],
+    "state": {
+      "phase": "guiding",
+      "active_mode": "proactive",
+      "last_user_intent": null,
+      "current_item_index": 0,
+      "current_issue_index": 0,
+      "issue_round": 0,
+      "stuck_counter": 0,
+      "hint_level": 0,
+      "current_focus_id": "1",
+      "current_line": 1,
+      "line1_completed": false,
+      "next": [
+        "wait_for_reply"
+      ],
+      "total_items": 3
+    }
+  },
+  {
+    "turn": "reply0:我再想想",
+    "ai": [
+      "✅ 你这轮思考有进展， 能不能再说说你具体会怎么改？\n\n💬 如果你现在就改写这段",
+      "📋 第 1/3 条\n\n✅ 你岗位价值这块写得挺实在的，我们来看一个可以更精准的地"
+    ],
+    "state": {
+      "phase": "guiding",
+      "active_mode": "proactive",
+      "last_user_intent": "reply",
+      "current_item_index": 0,
+      "current_issue_index": 0,
+      "issue_round": 1,
+      "stuck_counter": 0,
+      "hint_level": 0,
+      "current_focus_id": "1",
+      "current_line": 1,
+      "line1_completed": false,
+      "next": [
+        "wait_for_reply"
+      ],
+      "total_items": 3
+    }
+  },
+  {
+    "turn": "reply1:什么是三问法？",
+    "ai": [
+      "💫 针对你的问题<<什么是三问法？>>：\n这是一个很好的问题。可以先从服务对象、"
+    ],
+    "state": {
+      "phase": "guiding",
+      "active_mode": "reactive_qa",
+      "last_user_intent": "question",
+      "current_item_index": 0,
+      "current_issue_index": 0,
+      "issue_round": 1,
+      "stuck_counter": 0,
+      "hint_level": 0,
+      "current_focus_id": "1",
+      "current_line": 1,
+      "line1_completed": false,
+      "next": [
+        "wait_for_reply"
+      ],
+      "total_items": 3
+    }
+  },
+  {
+    "turn": "reply2:我会从客户视角改",
+    "ai": [
+      "✅ 你这轮给出了很具体的改进方向， 你已经明确了客户、好处和商业落点，这一项可以",
+      "📋 第 1/3 条\n\n✅ 你岗位价值这块写得挺实在的，我们来看一个可以更精准的地"
+    ],
+    "state": {
+      "phase": "guiding",
+      "active_mode": "proactive",
+      "last_user_intent": "reply",
+      "current_item_index": 0,
+      "current_issue_index": 1,
+      "issue_round": 0,
+      "stuck_counter": 0,
+      "hint_level": 0,
+      "current_focus_id": "2",
+      "current_line": 1,
+      "line1_completed": false,
+      "next": [
+        "wait_for_reply"
+      ],
+      "total_items": 3
+    }
+  },
+  {
+    "turn": "reply3:我再想想",
+    "ai": [
+      "✅ 你这轮思考有进展， 能不能再说说你具体会怎么改？\n\n💬 如果你现在就改写这段",
+      "📋 第 1/3 条\n\n✅ 你岗位价值这块写得挺实在的，我们来看一个可以更精准的地"
+    ],
+    "state": {
+      "phase": "guiding",
+      "active_mode": "proactive",
+      "last_user_intent": "reply",
+      "current_item_index": 0,
+      "current_issue_index": 1,
+      "issue_round": 1,
+      "stuck_counter": 0,
+      "hint_level": 0,
+      "current_focus_id": "2",
+      "current_line": 1,
+      "line1_completed": false,
+      "next": [
+        "wait_for_reply"
+      ],
+      "total_items": 3
+    }
+  },
+  {
+    "turn": "reply4:我再想想",
+    "ai": [
+      "✅ 你这轮思考有进展， 能不能再说说你具体会怎么改？\n\n💬 如果你现在就改写这段",
+      "📋 第 1/3 条\n\n✅ 你岗位价值这块写得挺实在的，我们来看一个可以更精准的地"
+    ],
+    "state": {
+      "phase": "guiding",
+      "active_mode": "proactive",
+      "last_user_intent": "reply",
+      "current_item_index": 0,
+      "current_issue_index": 1,
+      "issue_round": 2,
+      "stuck_counter": 0,
+      "hint_level": 0,
+      "current_focus_id": "2",
+      "current_line": 1,
+      "line1_completed": false,
+      "next": [
+        "wait_for_reply"
+      ],
+      "total_items": 3
+    }
+  },
+  {
+    "turn": "reply5:我打算把任务名改",
+    "ai": [
+      "✅ 你在往更具体的方向走了， 这个改进比之前具体多了，这一项可以过了。\n\n我们进",
+      "📋 第 1/3 条\n\n✅ 你岗位价值这块写得挺实在的，我们来看一个可以更精准的地"
+    ],
+    "state": {
+      "phase": "guiding",
+      "active_mode": "proactive",
+      "last_user_intent": "reply",
+      "current_item_index": 0,
+      "current_issue_index": 2,
+      "issue_round": 0,
+      "stuck_counter": 0,
+      "hint_level": 0,
+      "current_focus_id": "4",
+      "current_line": 1,
+      "line1_completed": false,
+      "next": [
+        "wait_for_reply"
+      ],
+      "total_items": 3
+    }
+  },
+  {
+    "turn": "reply6:我再想想",
+    "ai": [
+      "✅ 你这轮思考有进展， 能不能再说说你具体会怎么改？\n\n💬 如果你现在就改写这段",
+      "📋 第 1/3 条\n\n✅ 你岗位价值这块写得挺实在的，我们来看一个可以更精准的地"
+    ],
+    "state": {
+      "phase": "guiding",
+      "active_mode": "proactive",
+      "last_user_intent": "reply",
+      "current_item_index": 0,
+      "current_issue_index": 2,
+      "issue_round": 1,
+      "stuck_counter": 0,
+      "hint_level": 0,
+      "current_focus_id": "4",
+      "current_line": 1,
+      "line1_completed": false,
+      "next": [
+        "wait_for_reply"
+      ],
+      "total_items": 3
+    }
+  },
+  {
+    "turn": "reply7:我再想想",
+    "ai": [
+      "✅ 你这轮思考有进展， 能不能再说说你具体会怎么改？\n\n💬 如果你现在就改写这段",
+      "📋 第 1/3 条\n\n✅ 你岗位价值这块写得挺实在的，我们来看一个可以更精准的地"
+    ],
+    "state": {
+      "phase": "guiding",
+      "active_mode": "proactive",
+      "last_user_intent": "reply",
+      "current_item_index": 0,
+      "current_issue_index": 2,
+      "issue_round": 2,
+      "stuck_counter": 0,
+      "hint_level": 0,
+      "current_focus_id": "4",
+      "current_line": 1,
+      "line1_completed": false,
+      "next": [
+        "wait_for_reply"
+      ],
+      "total_items": 3
+    }
+  },
+  {
+    "turn": "reply8:我再想想",
+    "ai": [
+      "✅ 你这轮思考有进展， 能不能再说说你具体会怎么改？\n\n💬 如果只改 岗位价值 ",
+      "📋 第 1/3 条\n\n✅ 你岗位价值这块写得挺实在的，我们来看一个可以更精准的地"
+    ],
+    "state": {
+      "phase": "guiding",
+      "active_mode": "proactive",
+      "last_user_intent": "reply",
+      "current_item_index": 0,
+      "current_issue_index": 2,
+      "issue_round": 0,
+      "stuck_counter": 1,
+      "hint_level": 1,
+      "current_focus_id": "4",
+      "current_line": 1,
+      "line1_completed": false,
+      "next": [
+        "wait_for_reply"
+      ],
+      "total_items": 3
+    }
+  }
+]

@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 
 from .state import (
     CoachState, ReviewItem, RUBRIC_ITEMS, RUBRIC_INDEX,
@@ -73,38 +74,66 @@ def _is_llm_enabled() -> bool:
 
 
 # ─────────────────────────────────────────────────────────────
-# 参考文件加载
+# 参考文件加载（带模块级缓存，避免重复读取）
 # ─────────────────────────────────────────────────────────────
 
+_rubric_text_cache: Optional[str] = None
+_textbook_text_cache: Optional[str] = None
+_system_prompt_cache: Optional[str] = None
+
+
 def _load_rubric_text() -> str:
-    """加载项目内嵌的 rubric.md，不存在则使用 MOCK 数据"""
-    path = REFERENCES_DIR / "rubric.md"
-    if path.exists():
-        return path.read_text(encoding="utf-8")
-    return MOCK_SCORING_CRITERIA
+    """加载项目内嵌的 rubric.md，不存在则使用 MOCK 数据（缓存）"""
+    global _rubric_text_cache
+    if _rubric_text_cache is None:
+        path = REFERENCES_DIR / "rubric.md"
+        _rubric_text_cache = path.read_text(encoding="utf-8") if path.exists() else MOCK_SCORING_CRITERIA
+    return _rubric_text_cache
 
 
 def _load_textbook_text() -> str:
-    """加载项目内嵌的 textbook.md，不存在则使用 MOCK 数据"""
-    path = REFERENCES_DIR / "textbook.md"
-    if path.exists():
-        return path.read_text(encoding="utf-8")
-    return MOCK_TEACHING_MATERIAL
+    """加载项目内嵌的 textbook.md，不存在则使用 MOCK 数据（缓存）"""
+    global _textbook_text_cache
+    if _textbook_text_cache is None:
+        path = REFERENCES_DIR / "textbook.md"
+        _textbook_text_cache = path.read_text(encoding="utf-8") if path.exists() else MOCK_TEACHING_MATERIAL
+    return _textbook_text_cache
 
 
 # ─────────────────────────────────────────────────────────────
 # 进度脚本调用
 # ─────────────────────────────────────────────────────────────
 
-def _call_progress_script(*args: str) -> Optional[dict]:
-    """调用 progress.py 脚本，返回解析后的 JSON 或 None"""
+def _thread_id_from_config(config: Optional[dict]) -> Optional[str]:
+    """从 LangGraph 注入的 config 中取出 thread_id（用于隔离进度文件）。"""
+    if not config:
+        return None
+    return (config.get("configurable") or {}).get("thread_id")
+
+
+def _progress_file_for_thread(thread_id: Optional[str]) -> str:
+    """按 thread_id 生成隔离的进度文件路径，避免多会话串号。"""
+    if not thread_id:
+        return "/tmp/gangbiao-coach-progress.json"
+    safe = "".join(ch for ch in str(thread_id) if ch.isalnum() or ch in "-_")
+    return f"/tmp/gangbiao-coach-progress-{safe}.json"
+
+
+def _call_progress_script(*args: str, thread_id: Optional[str] = None) -> Optional[dict]:
+    """调用 progress.py 脚本，返回解析后的 JSON 或 None。
+
+    通过 STANDJOB_PROGRESS_FILE 环境变量把进度文件按 thread_id 隔离。
+    """
     script = SCRIPTS_DIR / "progress.py"
     if not script.exists():
         return None
+    env = dict(os.environ)
+    env["STANDJOB_PROGRESS_FILE"] = _progress_file_for_thread(thread_id)
     try:
         result = subprocess.run(
             ["python3", str(script)] + list(args),
             capture_output=True, text=True, timeout=10,
+            env=env,
         )
         if result.returncode == 0 and result.stdout.strip():
             return json.loads(result.stdout.strip())
@@ -314,6 +343,7 @@ def _coerce_rubric_item_id(raw: Any) -> Optional[int]:
 def _normalize_matched_issues(
     matched_issues: list[dict[str, Any]], row_data: dict[str, Any]
 ) -> tuple[list[dict[str, Any]], list[int]]:
+    """标准化匹配问题，应用灰区放过逻辑。"""
     normalized: list[dict[str, Any]] = []
     relaxed_ids: list[int] = []
 
@@ -322,15 +352,14 @@ def _normalize_matched_issues(
         if item_id is None:
             continue
         canonical = RUBRIC_INDEX[item_id]
+        # 严重程度：A=重点关注，B=可优化——仅用于内部排序，不给用户展示
         level = str(raw.get("level", canonical["level"]))
-        deduction = int(raw.get("deduction", 10 if level == "A" else 5))
         issue = {
             "issue_id": str(item_id),
             "rubric_item_id": item_id,
             "issue_desc": raw.get("issue_desc") or canonical["desc"],
             "category": raw.get("category") or canonical["category"],
             "level": "A" if level.upper() == "A" else "B",
-            "deduction": deduction,
             "explanation": raw.get("explanation", ""),
             "user_facing_desc": _sanitize_user_desc(
                 raw.get("user_facing_desc") or raw.get("issue_desc") or canonical["desc"]
@@ -350,54 +379,70 @@ def _normalize_matched_issues(
 # ─────────────────────────────────────────────────────────────
 
 def _build_system_prompt(scoring_criteria: str, teaching_material: str) -> str:
-    return f"""你是一名专业的岗标辅导专家，帮助员工完善"岗标价值与岗标任务"表格。
+    """构建系统提示（带模块级缓存，避免重复拼接大段文本）。"""
+    global _system_prompt_cache
+    if _system_prompt_cache is None:
+        _system_prompt_cache = _build_system_prompt_impl(scoring_criteria, teaching_material)
+    return _system_prompt_cache
 
-## 你的辅导原则（五条铁律）
 
-1. **【不直接给答案】** 永远不直接告诉用户"应该写什么"，而是通过提问引导用户自己思考
-2. **【严格依据评分标准】** 评审时必须逐条对照14项评分标准进行检查，不要使用自定义评分维度
-3. **【教材仅作背景】** 引导和回答基于教材内容，但在主动引导场景不要直接贴教材原文
-4. **【每次聚焦一点】** 每轮对话只聚焦一个问题，避免信息轰炸
-5. **【正向激励】** 先认可做得好的地方，再指出需要完善的地方
+def _build_system_prompt_impl(scoring_criteria: str, teaching_material: str) -> str:
+    return f"""你是岗标教练，像带徒弟一样陪用户打磨"岗位价值与岗位任务"材料。
 
-## 角色纪律
+## 你的角色（牢记）
 
-- **始终以教练身份对话**——不说"我来评审一下""根据我的分析"这类暴露模型思考过程的话，自然地聊
-- **引用教材和标准时，用人话表达核心意思，不报章节号、不报条目编号**
-- **不要展示评审过程**——用户不需要知道你对着14条逐条检查了
+- **身份**：有经验的岗标教练，不是评审官、不是考官
+- **风格**：像老同事在茶水间聊天，自然、口语化，不说教
+- **红线**：绝不暴露内部诊断过程——不报条目编号、不念章节号、不说"根据评分标准"
 
 ### 正确示例
-❌ "根据评分标准第7项，你的任务命名未按'动词+修饰语+名词'"
+❌ "根据评分标准第7项，你的任务命名不符合规范"
 ❌ "教材第5章提到'动词+修饰语+名词'格式"
+❌ "这个问题很严重，扣10分"
 ✅ "你写的'AI应用开发与业务落地'——'业务落地'听起来更像你想要的结果，而不是一个能直接动手做的动作。如果把任务名字换成'一看就知道要干什么'的写法，你觉得该怎么改？"
 
-## 评审打分规则
+## 辅导原则（五条铁律）
 
-- 满分100分
-- 每发现一个问题项，根据扣分等级扣分：A级扣10分，B级扣5分
-- 得分≥85分为通关
+1. **只提问，不代写** — 心里再清楚也用提问"钓"出答案，不直接给标准答案
+2. **内部严谨，对外像聊天** — 所有判断都有依据，但说出来要像老教练带人，不念标准
+3. **一次只拎一个点** — 当前问题没站稳不跳题
+4. **先肯定，再追一层** — 每次开口先点明具体进步，不是泛泛的"不错"
+5. **不给打分，不说通关** — 只诊断问题、引导解决，不评价好坏、不给分数
+
+## 双线推进（严禁混淆）
+
+**线1：客户 → 价值 → 效能**（必须先完成）
+- 关键客户定义（问题项0）
+- 岗位价值（问题项1-4）
+- 岗位效能（问题项5）
+
+**线2：任务 → 目的 → 成果**（线1完成后才能进入）
+- 岗位任务（问题项6-8）
+- 任务目的与成果（问题项9-14）
+
+**铁律**：严禁把任务和效能挂钩，两条线完全独立。
 
 ## 严格度校准（三问法）
 
-每条价值/任务先用此筛选，三问都过则放过不追问：
-1. 能圈出明确的"客户主语"吗？
-2. 客户能看到自己拿到的"具体好处"吗？
-3. 最终落到 收入/成本/风险/品牌 中至少一个吗？
+任何价值描述，先用这三问筛一遍：
+1. **谁**：能圈出明确的"客户主语"（产品经理/测试工程师/业务部门）吗？
+2. **得到啥**：客户能看到自己拿到的"具体好处"（不是你的动作）吗？
+3. **商业落点**：最终落到 收入/成本/风险/品牌 中至少一个吗？
 
-**灰色地带默认放过**——标准没明文覆盖的不主动找事。
+- 三问都过 → **及格，放过，不要追**
+- 任一未过 → 进引导清单
 
-**真实反例**：
+**灰色地带倾向于放过**——当某条描述既不像典型违规、又不能算明显合格时，**默认放过**。
+
+**真实反例**（务必记住）：
 {REAL_EXAMPLE}
-
-## 严格度校准对照表
-{json.dumps(STRICTNESS_TABLE, ensure_ascii=False, indent=2)}
 
 ---
 
-### 评审打分标准
+### 典型问题（内部诊断依据，对外不提）
 {scoring_criteria}
 
-### 教材内容
+### 教材精要（引导依据，用人话表达）
 {teaching_material}
 """
 
@@ -497,6 +542,46 @@ def _build_proactive_message(
     return content
 
 
+def _advance_to_next_item(state: CoachState, feedback: str) -> dict:
+    """推进到下一个条目或进入收尾"""
+    idx = state["current_item_index"]
+    rows = state["submission_rows"]
+    next_idx = idx + 1
+
+    # 计算当前线1完成状态
+    issue_queue = state.get("review_items", [{}])[idx].get("issue_queue", []) if state.get("review_items") else []
+    line1_issue_ids = {q["issue_id"] for q in issue_queue if q["rubric_item_id"] <= 5}
+    issue_status_map = dict(state.get("issue_status_map", {}))
+    line1_resolved_ids = {iid for iid in line1_issue_ids if issue_status_map.get(iid) == "resolved"}
+    line1_completed = len(line1_issue_ids) == len(line1_resolved_ids)
+
+    if next_idx >= len(rows):
+        return {
+            "phase": "done",
+            "current_item_index": next_idx,
+            "messages": [AIMessage(content=f"✅ {feedback}\n\n所有条目已辅导完毕！")],
+            "active_mode": "proactive",
+            "awaiting_user_input": False,
+            "current_line": 2,
+            "line1_completed": True,
+        }
+
+    return {
+        "current_item_index": next_idx,
+        "current_issue_index": 0,
+        "issue_round": 0,
+        "phase": "reviewing",
+        "active_mode": "proactive",
+        "pending_question": "",
+        "messages": [AIMessage(content=f"✅ {feedback}\n\n我们来看下一条。")],
+        "stuck_counter": 0,
+        "hint_level": 0,
+        "awaiting_user_input": False,
+        "current_line": 1,  # 新条目从线1开始
+        "line1_completed": False,
+    }
+
+
 def _build_escalation_question(
     issue: dict[str, Any], row_data: dict[str, Any], hint_level: int
 ) -> str:
@@ -521,7 +606,42 @@ def _build_escalation_question(
         f"你愿意先把它改成{lq}为谁带来什么具体结果{rq}的一句话吗？"
     )
 
-def _advance_to_next_item(state: CoachState, feedback: str) -> dict:
+def _find_next_issue(
+    queue_copy: list[dict],
+    current_idx: int,
+    line1_completed: bool,
+    issue_status_map: dict[str, str],
+) -> tuple[Optional[int], Optional[dict], Optional[str]]:
+    """
+    双线推进：找到下一个待处理的问题项。
+
+    规则：
+    - 线1（客户/价值/效能，rubric_item_id 0-5）全部完成后，才能进入线2（任务/目的/成果，6-14）
+    - 如果当前在线1且线1未完成，跳过线2问题项
+    - 返回 (next_idx, next_issue, transition_msg)，如果没有则返回 (None, None, None)
+    """
+    transition_msg: Optional[str] = None
+
+    for i in range(current_idx + 1, len(queue_copy)):
+        candidate = queue_copy[i]
+        rubric_id = candidate["rubric_item_id"]
+        issue_id = candidate["issue_id"]
+
+        # 跳过已解决的问题
+        if issue_status_map.get(issue_id) == "resolved":
+            continue
+
+        # 检查是否在正确的线上
+        if rubric_id > 5:  # 线2问题
+            if not line1_completed:
+                # 线1未完成，跳过线2问题，继续找线1问题
+                continue
+            # 这是从线1到线2的首次过渡
+            transition_msg = "客户-价值-效能这部分已经梳理清楚了，接下来我们看看任务设计和成果规划。"
+
+        return i, candidate, transition_msg
+
+    return None, None, None
     """推进到下一个条目或进入收尾"""
     idx = state["current_item_index"]
     rows = state["submission_rows"]
@@ -554,16 +674,17 @@ def _advance_to_next_item(state: CoachState, feedback: str) -> dict:
 # NODE 0: load_standards — 加载评审标准 + 检查进度
 # ─────────────────────────────────────────────────────────────
 
-def load_standards(state: CoachState) -> dict:
+def load_standards(state: CoachState, config: Optional[RunnableConfig] = None) -> dict:
     """
     初始化：加载评分标准和教材，检查是否有已保存的进度。
     对应 skill 阶段 0 的初始化 + 进度恢复检测。
     """
+    thread_id = _thread_id_from_config(config)
     scoring_criteria = _load_rubric_text()
     teaching_material = _load_textbook_text()
 
     # 检查进度
-    progress = _call_progress_script("show")
+    progress = _call_progress_script("show", thread_id=thread_id)
     has_saved = progress is not None and progress.get("file")
 
     if has_saved:
@@ -595,11 +716,12 @@ def load_standards(state: CoachState) -> dict:
 # 对应 skill 阶段 1：validate_sheets.py --extract
 # ─────────────────────────────────────────────────────────────
 
-def validate_structure(state: CoachState) -> dict:
+def validate_structure(state: CoachState, config: Optional[RunnableConfig] = None) -> dict:
     """
     结构校验：用 validate_sheets.py 校验文件结构是否完整，
     通过后提取结构化数据，否则告知用户缺少哪些区块。
     """
+    thread_id = _thread_id_from_config(config)
     file_path = state.get("submission_path", "")
     if not file_path:
         # 尝试创建 mock 文件
@@ -610,12 +732,12 @@ def validate_structure(state: CoachState) -> dict:
 
     if result is None:
         # 脚本不可用，回退到内部解析
-        return _fallback_validate(state, file_path)
+        return _fallback_validate(state, file_path, thread_id=thread_id)
 
     if not result.get("ok"):
         # validate_sheets.py may not handle all formats (e.g., merged cells).
         # Fall back to internal load_submission which is more flexible.
-        return _fallback_validate(state, file_path)
+        return _fallback_validate(state, file_path, thread_id=thread_id)
 
     # 校验通过，提取结构化数据
     data = result.get("data", {})
@@ -627,7 +749,7 @@ def validate_structure(state: CoachState) -> dict:
     ai_msg = "收到，我先看一眼你的材料……好，结构完整，咱们开始吧。"
 
     # 保存进度
-    _call_progress_script("init", file_path)
+    _call_progress_script("init", file_path, thread_id=thread_id)
 
     return {
         "submission_path": file_path,
@@ -678,7 +800,7 @@ def _convert_extracted_data(data: dict) -> tuple[list[str], list[dict], str]:
     return columns, rows, text
 
 
-def _fallback_validate(state: CoachState, file_path: str) -> dict:
+def _fallback_validate(state: CoachState, file_path: str, thread_id: Optional[str] = None) -> dict:
     """脚本不可用时的回退：直接使用内部 load_submission 解析"""
     try:
         columns, rows, text = load_submission(file_path)
@@ -698,7 +820,7 @@ def _fallback_validate(state: CoachState, file_path: str) -> dict:
             "phase": "loaded",
         }
 
-    _call_progress_script("init", file_path)
+    _call_progress_script("init", file_path, thread_id=thread_id)
     return {
         "submission_path": file_path,
         "submission_columns": columns,
@@ -749,11 +871,9 @@ def review_item(state: CoachState) -> dict:
     # 标准化 + 灰区放过
     normalized, relaxed_ids = _normalize_matched_issues(matched_issues, row_data)
 
-    # 计算分数
-    total_deduction = sum(issue["deduction"] for issue in normalized)
-    score = max(0, 100 - total_deduction)
-
-    # 构建 issue_queue（辅导顺序：岗位价值问题优先）
+    # 注意：skill 要求不给用户打分，仅用于内部诊断
+    # 构建 issue_queue（辅导顺序：严格按 skill 推进顺序）
+    # 顺序：0客户定义 → 1-4岗位价值 → 5效能 → 6-8任务 → 9-14目的成果
     issue_queue: list[dict[str, Any]] = []
     for issue in normalized:
         issue_queue.append({
@@ -766,10 +886,15 @@ def review_item(state: CoachState) -> dict:
             "user_facing_desc": issue["user_facing_desc"],
         })
 
-    # 岗位价值问题永远排最前
-    value_issues = [q for q in issue_queue if q["category"] == "岗位价值"]
-    other_issues = [q for q in issue_queue if q["category"] != "岗位价值"]
-    issue_queue = value_issues + other_issues
+    # 按 skill 要求的推进顺序排序
+    CATEGORY_ORDER = {
+        "客户定义": 0,
+        "岗位价值": 1,
+        "岗位效能": 2,
+        "岗位任务": 3,
+        "任务目的与成果": 4,
+    }
+    issue_queue.sort(key=lambda x: (CATEGORY_ORDER.get(x["category"], 99), x["rubric_item_id"]))
 
     if issue_queue:
         issue_queue[0]["status"] = "in_progress"
@@ -781,7 +906,6 @@ def review_item(state: CoachState) -> dict:
         review_items[idx] = {
             "row_index": idx,
             "row_data": row_data,
-            "score": score,
             "dimension_scores": {"matched_issues": normalized},
             "issues": [i["issue_desc"] for i in normalized],
             "suggestions": [],
@@ -793,7 +917,13 @@ def review_item(state: CoachState) -> dict:
         review_items.append({
             "row_index": idx,
             "row_data": row_data,
-            "score": score,
+            "dimension_scores": {"matched_issues": normalized},
+            "issues": [i["issue_desc"] for i in normalized],
+            "suggestions": [],
+            "standard_ref": "",
+            "status": "reviewed",
+            "issue_queue": issue_queue,
+        })
             "dimension_scores": {"matched_issues": normalized},
             "issues": [i["issue_desc"] for i in normalized],
             "suggestions": [],
@@ -822,68 +952,62 @@ def review_item(state: CoachState) -> dict:
             first_issue,
         )
 
-    print(f"[Node] review_item: 条目{idx+1}/{len(rows)}，发现{len(normalized)}个问题项，放过{len(relaxed_ids)}项，得分{score}")
+    print(f"[Node] review_item: 条目{idx+1}/{len(rows)}，发现{len(normalized)}个问题项，放过{len(relaxed_ids)}项")
 
-    # 没有发现问题：自动推进到下一条，不走引导流程
+    # 没有发现问题：自动推进到下一条，不走引导流程。
+    # 收尾与推进两种情况合并为一个返回，推进索引只在此处计算一次。
     if not issue_queue:
         next_idx = idx + 1
-        if next_idx >= len(rows):
+        is_last = next_idx >= len(rows)
+        if is_last:
             print(f"[Node] review_item: 所有条目均无问题，直接收尾")
-            return {
-                "review_items": review_items,
-                "score": score,
-                "all_issues": normalized,
-                "current_issue_index": 0,
-                "issue_round": 0,
-                "issue_status_map": issue_status_map,
-                "coaching_queue_order": coaching_queue_order,
-                "current_focus_id": None,
-                "pending_question": "",
-                "phase": "done",
-                "stuck_counter": 0,
-                "hint_level": 0,
-                "rubric_eval_summary": {
-                    "checked_item_ids": checked_item_ids,
-                    "matched_item_ids": [i["rubric_item_id"] for i in normalized],
-                    "relaxed_item_ids": relaxed_ids,
-                    "coverage_ok": len(checked_item_ids) == len(RUBRIC_ITEMS),
-                },
-                "messages": [AIMessage(
-                    content=f"📋 第 {idx+1}/{len(rows)} 条检查完毕，没有发现需要调整的地方。"
-                    + ("所有条目都已检查完毕，写得挺好！" if next_idx >= len(rows) else "")
-                )],
-            }
+            tail_msg = "所有条目都已检查完毕，写得挺好！"
         else:
             print(f"[Node] review_item: 条目{idx+1}无问题，自动推进到第{next_idx+1}条")
-            return {
-                "review_items": review_items,
-                "score": score,
-                "all_issues": normalized,
-                "current_item_index": next_idx,
-                "current_issue_index": 0,
-                "issue_round": 0,
-                "issue_status_map": issue_status_map,
-                "coaching_queue_order": coaching_queue_order,
-                "current_focus_id": None,
-                "pending_question": "",
-                "phase": "reviewing",
-                "stuck_counter": 0,
-                "hint_level": 0,
-                "rubric_eval_summary": {
-                    "checked_item_ids": checked_item_ids,
-                    "matched_item_ids": [i["rubric_item_id"] for i in normalized],
-                    "relaxed_item_ids": relaxed_ids,
-                    "coverage_ok": len(checked_item_ids) == len(RUBRIC_ITEMS),
-                },
-                "messages": [AIMessage(
-                    content=f"📋 第 {idx+1}/{len(rows)} 条检查完毕，没有发现需要调整的地方。继续看下一条。"
-                )],
-            }
+            tail_msg = "继续看下一条。"
+        result = {
+            "review_items": review_items,
+            "all_issues": normalized,
+            "current_issue_index": 0,
+            "issue_round": 0,
+            "issue_status_map": issue_status_map,
+            "coaching_queue_order": coaching_queue_order,
+            "current_focus_id": None,
+            "pending_question": "",
+            "phase": "done" if is_last else "reviewing",
+            "stuck_counter": 0,
+            "hint_level": 0,
+            "current_line": 2,  # 无线1问题，直接进入线2
+            "line1_completed": True,
+            "rubric_eval_summary": {
+                "checked_item_ids": checked_item_ids,
+                "matched_item_ids": [i["rubric_item_id"] for i in normalized],
+                "relaxed_item_ids": relaxed_ids,
+                "coverage_ok": len(checked_item_ids) == len(RUBRIC_ITEMS),
+            },
+            "messages": [AIMessage(
+                content=f"📋 第 {idx+1}/{len(rows)} 条检查完毕，没有发现需要调整的地方。" + tail_msg
+            )],
+        }
+        if not is_last:
+            result["current_item_index"] = next_idx
+        return result
+
+    # 判断当前属于线1还是线2，并确定线1是否已完成
+    # 线1：客户定义(0) + 岗位价值(1-4) + 岗位效能(5)
+    # 线2：岗位任务(6-8) + 任务目的与成果(9-14)
+    first_rubric_id = issue_queue[0]["rubric_item_id"] if issue_queue else 0
+    is_line1_issue = first_rubric_id <= 5  # 0-5 属于线1
+    current_line = 1 if is_line1_issue else 2
+
+    # 检查线1是否全部完成（无线1问题项或全部resolved）
+    line1_issue_ids = {q["issue_id"] for q in issue_queue if q["rubric_item_id"] <= 5}
+    line1_resolved = all(issue_status_map.get(iid) == "resolved" for iid in line1_issue_ids)
+    line1_completed = len(line1_issue_ids) == 0 or line1_resolved
 
     # 有问题项：进入引导流程
     return {
         "review_items": review_items,
-        "score": score,
         "all_issues": normalized,
         "current_issue_index": 0,
         "issue_round": 0,
@@ -894,6 +1018,8 @@ def review_item(state: CoachState) -> dict:
         "phase": "guiding",
         "stuck_counter": 0,
         "hint_level": 0,
+        "current_line": current_line,
+        "line1_completed": line1_completed,
         "rubric_eval_summary": {
             "checked_item_ids": checked_item_ids,
             "matched_item_ids": [i["rubric_item_id"] for i in normalized],
@@ -913,39 +1039,45 @@ def _llm_review(
     row_text = "\n".join(f"  {k}: {_format_value_for_view(v)}" for k, v in row_data.items() if v)
     rubric_text = "\n".join(f"{item['id']}. [{item['category']}] {item['desc']} (等级{item['level']})" for item in RUBRIC_ITEMS)
 
-    prompt = f"""请严格逐条对照以下14项评分标准，评审这条岗标条目。
+    prompt = f"""你是岗标教练，正在后台诊断用户的岗标材料。
 
-### 被评审内容
+**角色提醒**：这是内部诊断，用户完全看不到这个过程。不要输出"我正在诊断"等提示。
+
+### 被诊断内容
 {row_text}
 
-### 评审标准
+### 典型问题清单（逐条对照，不要遗漏）
 {rubric_text}
 
-### 评审要求
-1. **必须逐条检查14项**，不要遗漏
-2. 使用三问法筛选：三问都过则不扣分
-3. 灰色地带默认放过——标准没明文覆盖的不主动找事
-4. 每条命中的问题项需要给出扣分等级（A=10分, B=5分）
-5. 岗位价值问题优先级最高
+### 诊断守则
+1. **严格逐条检查**以上清单，不要遗漏
+2. **三问法筛选**：谁 / 得到啥 / 商业落点——三问都过则放过
+3. **灰区放过**：不像典型违规、又不能算明显合格时，默认放过
+4. **问题严重程度**：只标记"需要引导"（A级）或"可优化"（B级），绝不用"扣分""得分"等评审语言
 
-### 真实反例（三问法通过，不应扣分）
+### 真实反例（三问法通过，不应追问）
 {REAL_EXAMPLE}
 
+### 输出格式
 仅输出 JSON：
 {{
   "checked_item_ids": [1,2,3,...],
   "issues": [
     {{
       "issue_id": "1",
-      "issue_desc": "问题描述",
+      "issue_desc": "问题描述（用人话，不报编号）",
       "category": "岗位价值",
       "level": "A",
-      "deduction": 10,
       "explanation": "判定理由",
-      "user_facing_desc": "用户可见的自然语言描述"
+      "user_facing_desc": "给用户的自然语言描述（教练口吻）"
     }}
   ]
-}}"""
+}}
+
+**注意**：
+- 只输出真正需要引导的问题
+- 用户看不到这个输出，所以 issue_desc 是内部参考，user_facing_desc 是给用户看的"人话版"
+- 绝不要出现"扣分""得分""通关"等评审词汇"""
 
     try:
         llm = _get_llm()
@@ -1060,12 +1192,13 @@ def guide_reflection(state: CoachState) -> dict:
 # 回判三步：1.肯定进步 2.给出判断 3.追或不追
 # ─────────────────────────────────────────────────────────────
 
-def process_response(state: CoachState) -> dict:
+def process_response(state: CoachState, config: Optional[RunnableConfig] = None) -> dict:
     """
     分析用户对引导问题的回复。
     回判三步：肯定进步 → 给出判断 → 追或不追。
     "还能更好"不是追问的理由，"评委会扣分"才是。
     """
+    thread_id = _thread_id_from_config(config)
     idx = state["current_item_index"]
     review_items = state.get("review_items", [])
     current_review = review_items[idx] if idx < len(review_items) else None
@@ -1080,9 +1213,8 @@ def process_response(state: CoachState) -> dict:
     user_messages = [m for m in messages if isinstance(m, HumanMessage)]
     last_user_msg = user_messages[-1].content if user_messages else ""
 
-    if _is_question_intent(last_user_msg):
-        return answer_user_question(state)
-
+    # 意图已由 detect_user_intent 单点判定；此处不再二次分流到答疑，
+    # 避免 answer_user_question 返回缺 phase 导致同轮重发引导问题。
     if not current_review:
         return {"phase": "reviewing", "active_mode": "proactive", "last_user_intent": "reply"}
 
@@ -1096,37 +1228,48 @@ def process_response(state: CoachState) -> dict:
     system = _build_system_prompt(state["scoring_criteria"], state["teaching_material"])
     recent = messages[-8:] if len(messages) > 8 else messages
 
-    decide_prompt = f"""当前正在辅导第{idx+1}条岗标条目的当前问题项。
+    decide_prompt = f"""你是岗标教练，正在回判用户的修改回复。
 
-当前问题项：
-{json.dumps(current_issue, ensure_ascii=False)}
+**当前辅导位置**：第{idx+1}条岗标条目，当前问题项属于{'线1（客户/价值/效能）' if rubric_item_id <= 5 else '线2（任务/目的/成果）'}
 
-用户刚才回复："{last_user_msg}"
+**当前问题项**：
+类别：{current_issue.get('category', '')}
+问题描述：{current_issue.get('user_facing_desc', '')}
+
+**用户刚才回复**："{last_user_msg}"
 已进行轮次：{issue_round + 1}
+
+---
 
 请按照以下三步进行判断：
 
-**第一步：肯定进步**
-指出用户回复比上一轮好在哪个具体点（不能只说"很好"）。
+**第一步：肯定进步（必须具体）**
+指出用户回复比上一轮好在哪个**具体点**——改进了什么、补上了什么信息。不能只说"很好""有进步"。
 
 **第二步：给出判断**
 - 是否解决：用户是否给出可执行、可落地的改进方向？
-- 三问法检查（仅岗位价值类问题）：是否包含客户主语、具体好处、商业落点？
+- 三问法检查（仅岗位价值类问题：客户主语/具体好处/商业落点）
+
+**重要**：这是{'线1' if rubric_item_id <= 5 else '线2'}问题，{'线1完成后才能进入线2（任务/目的/成果）' if rubric_item_id <= 5 else '现在已进入线2，关注任务设计和成果规划'}
 
 **第三步：追或不追**
-- 问题解决或三问法合格 → 明确认可，跳下一项
+- 问题解决或三问法合格 → 明确认可，告知用户进入下一项（或进入线2）
 - 未解决但方向对 → 更具体地再问一次
-- 卡住超3轮 → 给候选项A/B/C，但仍以问题形式呈现
+- 卡住超3轮 → 给具体抓手（A/B/C候选项），但仍用问题形式
 
-**重要原则**："还能更好"不是追问的理由。三问法过了就放过。
+**红线原则**：
+1. "还能更好"不是追问理由，"解决问题"才是
+2. 灰区默认放过——三问法过了就停手
+3. 绝不说"打分""扣分""过关"等评审语言
 
 请仅输出 JSON：
 {{
-    "affirmation": "具体的肯定语...",
-    "issue_resolved": true,
-    "judgment": "自然语言判断...",
-    "feedback_to_user": "...",
-    "next_question": "..."
+    "affirmation": "具体的肯定语（如：你这轮补上了'产品经理'这个客户主语，比上一轮具体多了）...",
+    "issue_resolved": true/false,
+    "judgment": "自然语言判断（如：客户主语有了，但具体好处还不够清晰）...",
+    "feedback_to_user": "给用户的自然语言反馈（教练口吻，不说教）...",
+    "next_question": "下一步的引导问题（如果已解决则为空）...",
+    "transition_message": "{'线1到线2的过渡提示（如：客户价值这块已经清楚了，接下来我们看看任务设计）' if rubric_item_id <= 5 else ''}"
 }}"""
 
     if _is_llm_enabled():
@@ -1176,12 +1319,20 @@ def process_response(state: CoachState) -> dict:
         queue_copy[issue_idx]["status"] = "resolved"
 
         # 更新进度
-        _call_progress_script("update", current_issue_id, "pass", "三问法通过或用户给出可执行改进")
+        _call_progress_script("update", current_issue_id, "pass", "三问法通过或用户给出可执行改进", thread_id=thread_id)
 
-        next_issue_idx = issue_idx + 1
-        if next_issue_idx < len(queue_copy):
+        # 双线推进：检查线1是否全部完成
+        line1_issue_ids = {q["issue_id"] for q in queue_copy if q["rubric_item_id"] <= 5}
+        line1_resolved_ids = {iid for iid in line1_issue_ids if issue_status_map.get(iid) == "resolved"}
+        line1_completed = len(line1_issue_ids) == len(line1_resolved_ids)
+
+        # 找到下一个待处理的问题项（考虑双线推进限制）
+        next_issue_idx, next_issue, transition_msg = _find_next_issue(
+            queue_copy, issue_idx, line1_completed, issue_status_map
+        )
+
+        if next_issue_idx is not None and next_issue is not None:
             queue_copy[next_issue_idx]["status"] = "in_progress"
-            next_issue = queue_copy[next_issue_idx]
             issue_status_map[next_issue.get("issue_id", f"issue_{next_issue_idx}")] = "in_progress"
             next_issue_question = _generate_issue_question(
                 state["scoring_criteria"],
@@ -1190,8 +1341,16 @@ def process_response(state: CoachState) -> dict:
                 next_issue,
             )
             review_items[idx]["issue_queue"] = queue_copy
+
+            # 构建消息：包含过渡提示（如果从线1进入线2）
+            msg_content = f"✅ {feedback}"
+            if transition_msg:
+                msg_content += f"\n\n{transition_msg}"
+            else:
+                msg_content += "\n\n我们进入下一个关注点，继续逐项完善。"
+
             return {
-                "messages": [AIMessage(content=f"✅ {feedback}\n\n我们进入下一个关注点，继续逐项完善。")],
+                "messages": [AIMessage(content=msg_content)],
                 "review_items": review_items,
                 "issue_status_map": issue_status_map,
                 "current_issue_index": next_issue_idx,
@@ -1204,7 +1363,17 @@ def process_response(state: CoachState) -> dict:
                 "current_focus_id": next_issue.get("issue_id"),
                 "stuck_counter": 0,
                 "hint_level": 0,
+                "current_line": 2 if next_issue["rubric_item_id"] > 5 else 1,
+                "line1_completed": line1_completed,
             }
+
+        review_items[idx]["issue_queue"] = queue_copy
+        return {
+            **_advance_to_next_item(state, feedback),
+            "review_items": review_items,
+            "issue_status_map": issue_status_map,
+            "last_user_intent": "reply",
+        }
 
         review_items[idx]["issue_queue"] = queue_copy
         return {
@@ -1231,10 +1400,17 @@ def process_response(state: CoachState) -> dict:
             queue_copy[issue_idx]["status"] = "resolved"
             review_items[idx]["issue_queue"] = queue_copy
 
-            next_issue_idx = issue_idx + 1
-            if next_issue_idx < len(queue_copy):
+            # 双线推进：检查线1是否完成（同上）
+            line1_issue_ids = {q["issue_id"] for q in queue_copy if q["rubric_item_id"] <= 5}
+            line1_resolved_ids = {iid for iid in line1_issue_ids if issue_status_map.get(iid) == "resolved"}
+            line1_completed = len(line1_issue_ids) == len(line1_resolved_ids)
+
+            next_issue_idx, next_issue, transition_msg = _find_next_issue(
+                queue_copy, issue_idx, line1_completed, issue_status_map
+            )
+
+            if next_issue_idx is not None and next_issue is not None:
                 queue_copy[next_issue_idx]["status"] = "in_progress"
-                next_issue = queue_copy[next_issue_idx]
                 issue_status_map[next_issue.get("issue_id", f"issue_{next_issue_idx}")] = "in_progress"
                 next_question_new = _generate_issue_question(
                     state["scoring_criteria"],
@@ -1242,8 +1418,13 @@ def process_response(state: CoachState) -> dict:
                     rows[idx],
                     next_issue,
                 )
+                msg_content = "我们先放过这个点，后面有时间可以再回来打磨。"
+                if transition_msg:
+                    msg_content += f"\n\n{transition_msg}"
+                else:
+                    msg_content += " 我们进入下一个关注点。"
                 return {
-                    "messages": [AIMessage(content="我们先放过这个点，后面有时间可以再回来打磨。我们进入下一个关注点。")],
+                    "messages": [AIMessage(content=msg_content)],
                     "review_items": review_items,
                     "issue_status_map": issue_status_map,
                     "current_issue_index": next_issue_idx,
@@ -1256,6 +1437,8 @@ def process_response(state: CoachState) -> dict:
                     "current_focus_id": next_issue.get("issue_id"),
                     "stuck_counter": 0,
                     "hint_level": 0,
+                    "current_line": 2 if next_issue["rubric_item_id"] > 5 else 1,
+                    "line1_completed": line1_completed,
                 }
             else:
                 return {
@@ -1269,12 +1452,18 @@ def process_response(state: CoachState) -> dict:
         next_issue_round = 0
 
     content = f"✅ {feedback}\n\n💬 {next_question}"
+    # 计算当前线状态和线1完成状态（保持当前）
+    current_rubric_id = current_issue.get("rubric_item_id", 0)
+    current_line = 1 if current_rubric_id <= 5 else 2
+    line1_issue_ids = {q["issue_id"] for q in queue_copy if q["rubric_item_id"] <= 5}
+    line1_resolved_ids = {iid for iid in line1_issue_ids if issue_status_map.get(iid) == "resolved"}
+    line1_completed = len(line1_issue_ids) == len(line1_resolved_ids)
+
     return {
         "messages": [AIMessage(content=content)],
         "review_items": review_items,
         "pending_question": next_question,
         "issue_round": next_issue_round,
-        "reflection_round": state.get("reflection_round", 0) + 1,
         "awaiting_user_input": True,
         "phase": "guiding",
         "active_mode": "proactive",
@@ -1282,6 +1471,8 @@ def process_response(state: CoachState) -> dict:
         "current_focus_id": current_issue.get("issue_id"),
         "stuck_counter": stuck_counter,
         "hint_level": hint_level,
+        "current_line": current_line,
+        "line1_completed": line1_completed,
     }
 
 
@@ -1526,7 +1717,7 @@ def answer_user_question(state: CoachState) -> dict:
 # 对应 skill 阶段 4：自然总结 + 不给打分 + 教材收束
 # ─────────────────────────────────────────────────────────────
 
-def generate_closure(state: CoachState) -> dict:
+def generate_closure(state: CoachState, config: Optional[RunnableConfig] = None) -> dict:
     """
     收尾总结：
     - 哪些地方改得特别好
@@ -1560,7 +1751,7 @@ def generate_closure(state: CoachState) -> dict:
         closure_text = _rule_based_closure(highlights, remaining)
 
     # 清理进度
-    _call_progress_script("reset")
+    _call_progress_script("reset", thread_id=_thread_id_from_config(config))
 
     return {
         "phase": "closure",

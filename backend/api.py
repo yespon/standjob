@@ -75,7 +75,6 @@ class StateResponse(BaseModel):
     next_nodes: list[str]
     current_item_index: int
     total_items: int
-    reflection_round: int
     active_mode: str = "proactive"
     current_focus_id: str | None = None
     stuck_counter: int = 0
@@ -94,7 +93,6 @@ def _state_snapshot(config: dict) -> dict:
         "active_mode": values.get("active_mode", "proactive"),
         "current_item_index": values.get("current_item_index", 0),
         "total_items": len(values.get("submission_rows", [])),
-        "reflection_round": values.get("reflection_round", 0),
         "current_focus_id": values.get("current_focus_id"),
         "stuck_counter": values.get("stuck_counter", 0),
         "hint_level": values.get("hint_level", 0),
@@ -112,13 +110,13 @@ def start_session():
     config = {"configurable": {"thread_id": thread_id}}
 
     ai_messages = []
+    seen_ids: set[str] = set()
     for chunk in graph.stream({"messages": []}, config, stream_mode="values"):
         msgs = chunk.get("messages", [])
         for m in msgs:
-            if isinstance(m, AIMessage):
-                msg_dict = {"role": "assistant", "content": m.content}
-                if msg_dict not in ai_messages:
-                    ai_messages.append(msg_dict)
+            if isinstance(m, AIMessage) and m.id not in seen_ids:
+                seen_ids.add(m.id)
+                ai_messages.append({"role": "assistant", "content": m.content})
 
     snapshot = _state_snapshot(config)
 
@@ -200,7 +198,6 @@ def get_session_state(thread_id: str):
         next_nodes=snapshot["next_nodes"],
         current_item_index=snapshot["current_item_index"],
         total_items=snapshot["total_items"],
-        reflection_round=snapshot["reflection_round"],
         active_mode=snapshot["active_mode"],
         current_focus_id=snapshot["current_focus_id"],
         stuck_counter=snapshot["stuck_counter"],
@@ -226,12 +223,12 @@ def start_session_stream():
     def generate():
         yield _sse_event("session", {"thread_id": thread_id})
 
-        seen_contents: set[str] = set()
+        seen_ids: set[str] = set()
         for chunk in graph.stream({"messages": []}, config, stream_mode="values"):
             msgs = chunk.get("messages", [])
             for m in msgs:
-                if isinstance(m, AIMessage) and m.content not in seen_contents:
-                    seen_contents.add(m.content)
+                if isinstance(m, AIMessage) and m.id not in seen_ids:
+                    seen_ids.add(m.id)
                     yield _sse_event("message", {
                         "role": "assistant",
                         "content": m.content,
@@ -269,19 +266,19 @@ def chat_stream(req: SendMessageRequest):
 
         graph.update_state(config, update)
 
-        # 预填充已有 AI 消息，避免重复发送历史消息
+        # 预填充已有 AI 消息 id，只发送本次新产生的消息（按 id 去重）
         pre_state = graph.get_state(config)
-        seen_contents: set[str] = set()
+        seen_ids: set[str] = set()
         for m in pre_state.values.get("messages", []):
             if isinstance(m, AIMessage):
-                seen_contents.add(m.content)
+                seen_ids.add(m.id)
 
         try:
             for chunk in graph.stream(None, config, stream_mode="values"):
                 msgs = chunk.get("messages", [])
                 for m in msgs:
-                    if isinstance(m, AIMessage) and m.content not in seen_contents:
-                        seen_contents.add(m.content)
+                    if isinstance(m, AIMessage) and m.id not in seen_ids:
+                        seen_ids.add(m.id)
                         yield _sse_event("message", {
                             "role": "assistant",
                             "content": m.content,

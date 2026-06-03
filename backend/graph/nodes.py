@@ -924,13 +924,6 @@ def review_item(state: CoachState) -> dict:
             "status": "reviewed",
             "issue_queue": issue_queue,
         })
-            "dimension_scores": {"matched_issues": normalized},
-            "issues": [i["issue_desc"] for i in normalized],
-            "suggestions": [],
-            "standard_ref": "",
-            "status": "reviewed",
-            "issue_queue": issue_queue,
-        })
 
     # 构建 coaching_queue_order（辅导队列）
     coaching_queue_order = [q["issue_id"] for q in issue_queue]

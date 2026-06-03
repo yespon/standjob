@@ -56,10 +56,16 @@ from .nodes import (
 # 条件边：判断当前应走哪个分支
 # ─────────────────────────────────────────────────────────────
 
-def route_after_load(state: CoachState) -> Literal["wait_for_file"]:
-    """load_standards 之后：等待用户上传文件"""
-    return "wait_for_file"
 
+
+def _route_by_phase(state: CoachState) -> str:
+    """Shared phase-based routing."""
+    phase = state.get("phase", "guiding")
+    if phase == "done":
+        return "generate_closure"
+    if phase == "reviewing":
+        return "review_item"
+    return "guide_reflection"
 
 def route_after_validate(state: CoachState) -> Literal["wait_for_file", "review_item"]:
     """
@@ -73,26 +79,15 @@ def route_after_validate(state: CoachState) -> Literal["wait_for_file", "review_
 
 
 def route_after_review(state: CoachState) -> Literal["guide_reflection", "generate_closure", "review_item"]:
-    """review_item 之后路由"""
-    phase = state.get("phase", "guiding")
-    if phase == "done":
-        return "generate_closure"
-    if phase == "reviewing":
-        # 当前条目无问题，自动推进到下一条
-        return "review_item"
-    return "guide_reflection"
-
+    """review_item -> delegate to _route_by_phase."""
+    return _route_by_phase(state)  # type: ignore[return-value]
 
 def route_after_guide(state: CoachState) -> Literal["wait_for_reply", "review_item", "generate_closure"]:
-    """guide_reflection 之后路由"""
+    """guide_reflection -> done/reviewing via _route_by_phase, else wait."""
     phase = state.get("phase", "guiding")
-    if phase == "done":
-        return "generate_closure"
-    if phase == "reviewing":
-        # 当前条目无问题，自动推进到下一条
-        return "review_item"
+    if phase in ("done", "reviewing"):
+        return _route_by_phase(state)  # type: ignore[return-value]
     return "wait_for_reply"
-
 
 def route_after_intent(state: CoachState) -> Literal["process_response", "answer_user_question"]:
     """基于 detect_user_intent 节点结果进行路由"""
@@ -102,30 +97,16 @@ def route_after_intent(state: CoachState) -> Literal["process_response", "answer
     return "process_response"
 
 
-def route_after_process_response(state: CoachState) -> Literal[
-    "review_item", "guide_reflection", "generate_closure", "wait_for_reply"
-]:
-    """
-    process_response 之后的路由：
-    - phase="done"        → 收尾
-    - phase="reviewing"   → 有新条目待评审 → review_item
-    - phase="guiding"     → 继续当前条目引导 → guide_reflection
-    - phase="closure"     → 已在收尾流程
-    """
+def route_after_process_response(state: CoachState) -> Literal["review_item", "guide_reflection", "generate_closure", "wait_for_reply"]:
+    """process_response -> done/reviewing via _route_by_phase, closure->wait, else guide."""
     phase = state.get("phase", "guiding")
-    if phase == "done":
-        return "generate_closure"
-    elif phase == "reviewing":
-        return "review_item"
-    elif phase in {"closure"}:
+    if phase in ("done", "reviewing"):
+        return _route_by_phase(state)  # type: ignore[return-value]
+    if phase == "closure":
         return "wait_for_reply"
-    else:
-        return "guide_reflection"
+    return "guide_reflection"
 
 
-def route_after_closure(state: CoachState) -> Literal["wait_for_reply", "END"]:
-    """收尾之后：等待用户继续提问或结束"""
-    return "wait_for_reply"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -245,7 +226,7 @@ def build_graph() -> StateGraph:
     )
 
     # 阶段 4: 收尾 → 等待用户继续提问或结束
-    builder.add_edge("generate_closure", "wait_for_reply")
+    builder.add_edge("generate_closure", END)
 
     # ── 编译（interrupt_before 让 wait 节点暂停等待用户输入） ──
     memory = MemorySaver()
@@ -276,7 +257,6 @@ def send_user_message(
 
     update: dict = {
         "messages": [HumanMessage(content=user_input)],
-        "awaiting_user_input": False,
     }
     if file_path:
         update["submission_path"] = file_path

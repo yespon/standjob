@@ -210,6 +210,7 @@ class CoachState(TypedDict):
     # ── 预加载的评审标准（启动时一次性写入，后续只读） ─────────────
     scoring_criteria: Optional[str]    # 评分标准文本（来自 rubric.md）
     teaching_material: Optional[str]   # 教材文本（来自 textbook.md）
+    system_prompt: Optional[str]        # 预计算的完整系统提示（load_standards 中一次构造）
     phase: str                         # init | loaded | validating | reviewing | guiding | done | closure
     active_mode: str                   # proactive | reactive_qa
     last_user_intent: str              # reply | question

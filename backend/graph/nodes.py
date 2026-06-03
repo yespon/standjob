@@ -13,8 +13,6 @@
 from __future__ import annotations
 import os
 import json
-import subprocess
-import shutil
 from pathlib import Path
 from typing import Any, Optional
 
@@ -30,6 +28,8 @@ from ..loaders import (
     load_scoring_criteria,
     load_submission,
     load_pdf_as_text,
+    validate_structure,
+    extract_structured,
     MOCK_SCORING_CRITERIA,
     MOCK_TEACHING_MATERIAL,
 )
@@ -64,13 +64,11 @@ def _get_llm():
             _llm_instance = None
     return _llm_instance
 
-
 def _is_llm_enabled() -> bool:
     disabled = os.environ.get("STANDJOB_DISABLE_LLM", "").lower() in {"1", "true", "yes", "on"}
     if disabled:
         return False
     return any(os.environ.get(k) for k in ("OPENAI_API_KEY", "DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY"))
-
 
 # ─────────────────────────────────────────────────────────────
 # 参考文件加载
@@ -83,7 +81,6 @@ def _load_rubric_text() -> str:
         return path.read_text(encoding="utf-8")
     return MOCK_SCORING_CRITERIA
 
-
 def _load_textbook_text() -> str:
     """加载项目内嵌的 textbook.md，不存在则使用 MOCK 数据"""
     path = REFERENCES_DIR / "textbook.md"
@@ -91,46 +88,32 @@ def _load_textbook_text() -> str:
         return path.read_text(encoding="utf-8")
     return MOCK_TEACHING_MATERIAL
 
-
 # ─────────────────────────────────────────────────────────────
 # 进度脚本调用
 # ─────────────────────────────────────────────────────────────
 
-def _call_progress_script(*args: str) -> Optional[dict]:
-    """调用 progress.py 脚本，返回解析后的 JSON 或 None"""
-    script = SCRIPTS_DIR / "progress.py"
-    if not script.exists():
-        return None
-    try:
-        result = subprocess.run(
-            ["python3", str(script)] + list(args),
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return json.loads(result.stdout.strip())
-    except Exception as e:
-        print(f"[进度脚本] 调用失败: {e}")
-    return None
-
-
 def _call_validate_script(file_path: str, extract: bool = False) -> Optional[dict]:
-    """调用 validate_sheets.py 脚本"""
-    script = SCRIPTS_DIR / "validate_sheets.py"
-    if not script.exists():
-        return None
-    cmd = ["python3", str(script), file_path]
-    if extract:
-        cmd.append("--extract")
+    """Validate and extract structure using loaders directly."""
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30,
-        )
-        if result.stdout.strip():
-            return json.loads(result.stdout.strip())
+        wb = openpyxl.load_workbook(file_path, data_only=True)
     except Exception as e:
-        print(f"[校验脚本] 调用失败: {e}")
-    return None
-
+        print(f"[校验] 无法打开文件: {e}")
+        return None
+    try:
+        missing, info = validate_structure(wb)
+    except Exception as e:
+        print(f"[校验] 结构校验失败: {e}")
+        return None
+    result = {"ok": len(missing) == 0, "file": file_path}
+    result.update(info)
+    if extract and not missing:
+        try:
+            result["data"] = extract_structured(wb)
+        except Exception as e:
+            print(f"[校验] 内容提取失败: {e}")
+            return None
+    wb.close()
+    return result
 
 # ─────────────────────────────────────────────────────────────
 # 辅助函数
@@ -147,20 +130,17 @@ def _safe_json_load(raw: str, fallback: dict) -> dict:
     except Exception:
         return fallback
 
-
 def _is_question_intent(text: str) -> bool:
     stripped = (text or "").strip()
     if not stripped:
         return False
     return any(h in stripped for h in QUESTION_HINTS)
 
-
 def _is_reply_intent(text: str) -> bool:
     stripped = (text or "").strip()
     if not stripped:
         return False
     return any(h in stripped for h in REPLY_HINTS)
-
 
 def _rule_based_intent(text: str) -> tuple[str, float]:
     stripped = (text or "").strip()
@@ -175,7 +155,6 @@ def _rule_based_intent(text: str) -> tuple[str, float]:
     if q and r:
         return "uncertain", 0.4
     return "reply", 0.55
-
 
 def _passes_three_questions(text: str) -> bool:
     """三问法：客户主语 + 具体好处 + 商业落点"""
@@ -193,7 +172,6 @@ def _passes_three_questions(text: str) -> bool:
     )
     return has_who and has_benefit and has_biz
 
-
 def _sanitize_user_desc(text: str) -> str:
     sanitized = (text or "").strip()
     blocked = [
@@ -206,14 +184,12 @@ def _sanitize_user_desc(text: str) -> str:
         sanitized = sanitized.replace(token, "")
     return sanitized.strip("：:，,。 ") or "当前表达还有一层关键信息不够具体。"
 
-
 def _extract_value_text(row_data: dict[str, Any]) -> str:
     texts: list[str] = []
     for key, value in row_data.items():
         if "岗位价值" in key and value:
             texts.append(str(value))
     return " ".join(texts)
-
 
 def _format_value_for_view(value: Any) -> str:
     if isinstance(value, list):
@@ -224,7 +200,6 @@ def _format_value_for_view(value: Any) -> str:
                 items.append(f"{idx}. {' | '.join(task_parts)}")
         return "\n".join(items)
     return str(value)
-
 
 def _pick_related_fields(row_data: dict[str, Any], issue: dict[str, Any]) -> list[str]:
     desc = f"{issue.get('category', '')} {issue.get('issue_desc', '')} {issue.get('explanation', '')}".lower()
@@ -253,7 +228,6 @@ def _pick_related_fields(row_data: dict[str, Any], issue: dict[str, Any]) -> lis
         ranked.sort(key=lambda x: (-x[0], x[1]))
         return [k for _, k in ranked[:3]]
     return non_empty_keys[:2]
-
 
 # ─────────────────────────────────────────────────────────────
 # 灰区放过逻辑
@@ -297,7 +271,6 @@ def _should_relax_issue(item_id: int, row_data: dict[str, Any], issue: dict[str,
 
     return False
 
-
 def _coerce_rubric_item_id(raw: Any) -> Optional[int]:
     if raw is None:
         return None
@@ -309,7 +282,6 @@ def _coerce_rubric_item_id(raw: Any) -> Optional[int]:
         return None
     item_id = int(digits)
     return item_id if item_id in RUBRIC_INDEX else None
-
 
 def _normalize_matched_issues(
     matched_issues: list[dict[str, Any]], row_data: dict[str, Any]
@@ -343,7 +315,6 @@ def _normalize_matched_issues(
 
     normalized.sort(key=lambda x: int(x.get("rubric_item_id", 99)))
     return normalized, sorted(set(relaxed_ids))
-
 
 # ─────────────────────────────────────────────────────────────
 # 构建系统提示（五条铁律）
@@ -389,9 +360,6 @@ def _build_system_prompt(scoring_criteria: str, teaching_material: str) -> str:
 **真实反例**：
 {REAL_EXAMPLE}
 
-## 严格度校准对照表
-{json.dumps(STRICTNESS_TABLE, ensure_ascii=False, indent=2)}
-
 ---
 
 ### 评审打分标准
@@ -400,7 +368,6 @@ def _build_system_prompt(scoring_criteria: str, teaching_material: str) -> str:
 ### 教材内容
 {teaching_material}
 """
-
 
 # ─────────────────────────────────────────────────────────────
 # 引导问题生成
@@ -418,7 +385,7 @@ def _generate_issue_question(
 
     if weapon and _is_llm_enabled():
         # 有对应的引导武器，让 LLM 基于武器风格 + 教材生成自然的问题
-        system = _build_system_prompt(scoring_criteria, teaching_material)
+        system = scoring_criteria + "\n" + teaching_material
         category = issue.get("category", "")
         user_desc = issue.get("user_facing_desc", issue.get("issue_desc", ""))
 
@@ -471,7 +438,6 @@ def _generate_issue_question(
     # 最终兜底
     return "你觉得这个地方还能怎么写得更有说服力？"
 
-
 def _build_proactive_message(
     idx: int, total: int, row_data: dict[str, Any],
     issue: dict[str, Any], question: str,
@@ -495,7 +461,6 @@ def _build_proactive_message(
         f"💬 {question}"
     )
     return content
-
 
 def _build_escalation_question(
     issue: dict[str, Any], row_data: dict[str, Any], hint_level: int
@@ -533,7 +498,7 @@ def _advance_to_next_item(state: CoachState, feedback: str) -> dict:
             "current_item_index": next_idx,
             "messages": [AIMessage(content=f"✅ {feedback}\n\n所有条目已辅导完毕！")],
             "active_mode": "proactive",
-            "awaiting_user_input": False,
+            
         }
 
     return {
@@ -546,9 +511,8 @@ def _advance_to_next_item(state: CoachState, feedback: str) -> dict:
         "messages": [AIMessage(content=f"✅ {feedback}\n\n我们来看下一条。")],
         "stuck_counter": 0,
         "hint_level": 0,
-        "awaiting_user_input": False,
+        
     }
-
 
 # ─────────────────────────────────────────────────────────────
 # NODE 0: load_standards — 加载评审标准 + 检查进度
@@ -561,34 +525,17 @@ def load_standards(state: CoachState) -> dict:
     """
     scoring_criteria = _load_rubric_text()
     teaching_material = _load_textbook_text()
-
-    # 检查进度
-    progress = _call_progress_script("show")
-    has_saved = progress is not None and progress.get("file")
-
-    if has_saved:
-        welcome = (
-            "嘿，我看到你上次有做到一半的辅导记录——"
-            "要不要接着上次的来？还是重新开始？"
-        )
-        return {
-            "scoring_criteria": scoring_criteria,
-            "teaching_material": teaching_material,
-            "phase": "loaded",
-            "has_saved_progress": True,
-            "progress_snapshot": progress,
-            "messages": [AIMessage(content=welcome)],
-        }
+    system_prompt = _build_system_prompt(scoring_criteria, teaching_material)
 
     welcome = "来，先把你的材料给我看看——把《岗位价值与岗位任务》那个 Excel 的路径发我就行。"
     return {
+        "system_prompt": system_prompt,
         "scoring_criteria": scoring_criteria,
         "teaching_material": teaching_material,
         "phase": "loaded",
         "has_saved_progress": False,
         "messages": [AIMessage(content=welcome)],
     }
-
 
 # ─────────────────────────────────────────────────────────────
 # NODE 1: validate_structure — 结构校验 + 内容提取
@@ -626,9 +573,6 @@ def validate_structure(state: CoachState) -> dict:
     # 用自然的语气告诉用户
     ai_msg = "收到，我先看一眼你的材料……好，结构完整，咱们开始吧。"
 
-    # 保存进度
-    _call_progress_script("init", file_path)
-
     return {
         "submission_path": file_path,
         "submission_columns": columns,
@@ -640,7 +584,6 @@ def validate_structure(state: CoachState) -> dict:
         "current_item_index": 0,
         "messages": [AIMessage(content=ai_msg)],
     }
-
 
 def _convert_extracted_data(data: dict) -> tuple[list[str], list[dict], str]:
     """将 validate_sheets.py 提取的数据转为 submission_rows 格式"""
@@ -677,7 +620,6 @@ def _convert_extracted_data(data: dict) -> tuple[list[str], list[dict], str]:
     text = "\n".join(lines)
     return columns, rows, text
 
-
 def _fallback_validate(state: CoachState, file_path: str) -> dict:
     """脚本不可用时的回退：直接使用内部 load_submission 解析"""
     try:
@@ -698,7 +640,6 @@ def _fallback_validate(state: CoachState, file_path: str) -> dict:
             "phase": "loaded",
         }
 
-    _call_progress_script("init", file_path)
     return {
         "submission_path": file_path,
         "submission_columns": columns,
@@ -710,7 +651,6 @@ def _fallback_validate(state: CoachState, file_path: str) -> dict:
         "current_item_index": 0,
         "messages": [AIMessage(content="材料收到了，我过了一遍，该有的都有——咱们直接进入正题。")],
     }
-
 
 # ─────────────────────────────────────────────────────────────
 # NODE 2: review_item — 全面评审（后台，不暴露过程）
@@ -902,13 +842,12 @@ def review_item(state: CoachState) -> dict:
         },
     }
 
-
 def _llm_review(
     scoring_criteria: str, teaching_material: str,
     row_data: dict[str, Any], columns: list[str],
 ) -> tuple[list[dict[str, Any]], list[int]]:
     """LLM 评审：逐条对照 14 项评分标准"""
-    system = _build_system_prompt(scoring_criteria, teaching_material)
+    system = scoring_criteria + "\n" + teaching_material
 
     row_text = "\n".join(f"  {k}: {_format_value_for_view(v)}" for k, v in row_data.items() if v)
     rubric_text = "\n".join(f"{item['id']}. [{item['category']}] {item['desc']} (等级{item['level']})" for item in RUBRIC_ITEMS)
@@ -963,7 +902,6 @@ def _llm_review(
         print(f"[LLM 评审失败] {e}")
         return _rule_based_review(row_data)
 
-
 def _rule_based_review(row_data: dict[str, Any]) -> tuple[list[dict[str, Any]], list[int]]:
     """无 LLM 时的规则评审"""
     issues: list[dict[str, Any]] = []
@@ -1005,7 +943,6 @@ def _rule_based_review(row_data: dict[str, Any]) -> tuple[list[dict[str, Any]], 
                 issues.append({"issue_id": "13", "issue_desc": "把交付物当做成果", "category": "任务目的与成果", "level": "A", "deduction": 10})
 
     return issues, checked
-
 
 # ─────────────────────────────────────────────────────────────
 # NODE 3: guide_reflection — 分步引导（核心环节）
@@ -1049,11 +986,10 @@ def guide_reflection(state: CoachState) -> dict:
 
     return {
         "messages": [AIMessage(content=content)],
-        "awaiting_user_input": True,
+        
         "phase": "guiding",
         "active_mode": "proactive",
     }
-
 
 # ─────────────────────────────────────────────────────────────
 # NODE 3b: process_response — 处理用户回复
@@ -1093,7 +1029,7 @@ def process_response(state: CoachState) -> dict:
     current_issue = issue_queue[min(issue_idx, len(issue_queue) - 1)]
     rubric_item_id = int(current_issue.get("rubric_item_id", 0) or 0)
 
-    system = _build_system_prompt(state["scoring_criteria"], state["teaching_material"])
+    system = state.get("system_prompt", state["scoring_criteria"] + "\n" + state["teaching_material"])
     recent = messages[-8:] if len(messages) > 8 else messages
 
     decide_prompt = f"""当前正在辅导第{idx+1}条岗标条目的当前问题项。
@@ -1175,9 +1111,6 @@ def process_response(state: CoachState) -> dict:
         issue_status_map[current_issue_id] = "resolved"
         queue_copy[issue_idx]["status"] = "resolved"
 
-        # 更新进度
-        _call_progress_script("update", current_issue_id, "pass", "三问法通过或用户给出可执行改进")
-
         next_issue_idx = issue_idx + 1
         if next_issue_idx < len(queue_copy):
             queue_copy[next_issue_idx]["status"] = "in_progress"
@@ -1200,7 +1133,7 @@ def process_response(state: CoachState) -> dict:
                 "phase": "guiding",
                 "active_mode": "proactive",
                 "last_user_intent": "reply",
-                "awaiting_user_input": False,
+                
                 "current_focus_id": next_issue.get("issue_id"),
                 "stuck_counter": 0,
                 "hint_level": 0,
@@ -1252,7 +1185,7 @@ def process_response(state: CoachState) -> dict:
                     "phase": "guiding",
                     "active_mode": "proactive",
                     "last_user_intent": "reply",
-                    "awaiting_user_input": False,
+                    
                     "current_focus_id": next_issue.get("issue_id"),
                     "stuck_counter": 0,
                     "hint_level": 0,
@@ -1275,7 +1208,7 @@ def process_response(state: CoachState) -> dict:
         "pending_question": next_question,
         "issue_round": next_issue_round,
         "reflection_round": state.get("reflection_round", 0) + 1,
-        "awaiting_user_input": True,
+        
         "phase": "guiding",
         "active_mode": "proactive",
         "last_user_intent": "reply",
@@ -1283,7 +1216,6 @@ def process_response(state: CoachState) -> dict:
         "stuck_counter": stuck_counter,
         "hint_level": hint_level,
     }
-
 
 def _fallback_decision(user_msg: str, rubric_item_id: int) -> dict:
     """无 LLM 时的兜底判断逻辑"""
@@ -1391,8 +1323,6 @@ def _fallback_decision(user_msg: str, rubric_item_id: int) -> dict:
         "next_question": "如果你现在就改写这段内容，你会先增加哪一个可量化或可验证的信息？",
     }
 
-
-
 # ─────────────────────────────────────────────────────────────
 # NODE 3c: detect_user_intent — 意图识别
 # ─────────────────────────────────────────────────────────────
@@ -1416,13 +1346,9 @@ def detect_user_intent(state: CoachState) -> dict:
         "active_mode": "reactive_qa" if intent == "question" else "proactive",
     }
 
-
 def _llm_intent_fallback(state: CoachState, user_text: str) -> str:
     """二判：当规则不稳定时，用轻量 LLM 分类"""
-    system = _build_system_prompt(
-        state.get("scoring_criteria", MOCK_SCORING_CRITERIA),
-        state.get("teaching_material", MOCK_TEACHING_MATERIAL),
-    )
+    system = state.get("system_prompt", MOCK_SCORING_CRITERIA + "\n" + MOCK_TEACHING_MATERIAL)
     prompt = f"""请判断用户最新输入意图。
 
 当前阶段: {state.get('phase', 'guiding')}
@@ -1450,7 +1376,6 @@ def _llm_intent_fallback(state: CoachState, user_text: str) -> str:
     intent = str(parsed.get("intent", "reply")).strip().lower()
     return intent if intent in {"reply", "question"} else "reply"
 
-
 # ─────────────────────────────────────────────────────────────
 # NODE 3d: answer_user_question — 被动答疑
 # ─────────────────────────────────────────────────────────────
@@ -1461,10 +1386,7 @@ def answer_user_question(state: CoachState) -> dict:
     user_messages = [m for m in messages if isinstance(m, HumanMessage)]
     question = user_messages[-1].content if user_messages else ""
 
-    system = _build_system_prompt(
-        state.get("scoring_criteria", MOCK_SCORING_CRITERIA),
-        state.get("teaching_material", MOCK_TEACHING_MATERIAL),
-    )
+    system = state.get("system_prompt", MOCK_SCORING_CRITERIA + "\n" + MOCK_TEACHING_MATERIAL)
     qa_prompt = f"""用户主动提问如下，请进入被动答疑模式给出专业回答。
 
 用户问题：{question}
@@ -1517,9 +1439,8 @@ def answer_user_question(state: CoachState) -> dict:
         "messages": [AIMessage(content=content)],
         "active_mode": "reactive_qa",
         "last_user_intent": "question",
-        "awaiting_user_input": True,
+        
     }
-
 
 # ─────────────────────────────────────────────────────────────
 # NODE 4: generate_closure — 收尾总结
@@ -1559,23 +1480,19 @@ def generate_closure(state: CoachState) -> dict:
     else:
         closure_text = _rule_based_closure(highlights, remaining)
 
-    # 清理进度
-    _call_progress_script("reset")
-
     return {
         "phase": "closure",
         "closure_summary": closure_text,
         "highlights": highlights,
         "remaining_polish": remaining,
         "messages": [AIMessage(content=closure_text)],
-        "awaiting_user_input": True,
+        
         "active_mode": "reactive_qa",
     }
 
-
 def _llm_closure(state: CoachState, highlights: list[str], remaining: list[str]) -> str:
     """LLM 生成收尾总结"""
-    system = _build_system_prompt(state["scoring_criteria"], state["teaching_material"])
+    system = state.get("system_prompt", state["scoring_criteria"] + "\n" + state["teaching_material"])
 
     h_text = "\n".join(f"- {h}" for h in highlights) if highlights else "（无特别突出的修改）"
     r_text = "\n".join(f"- {r}" for r in remaining) if remaining else "（没有需要继续打磨的地方了）"
@@ -1608,7 +1525,6 @@ def _llm_closure(state: CoachState, highlights: list[str], remaining: list[str])
     except Exception:
         return _rule_based_closure(highlights, remaining)
 
-
 def _rule_based_closure(highlights: list[str], remaining: list[str]) -> str:
     """规则兜底收尾总结"""
     parts = []
@@ -1630,7 +1546,6 @@ def _rule_based_closure(highlights: list[str], remaining: list[str]) -> str:
     )
 
     return "\n".join(parts)
-
 
 # ─────────────────────────────────────────────────────────────
 # 辅助：创建 Mock 提交文件
